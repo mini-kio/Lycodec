@@ -1,0 +1,63 @@
+sample_rate: 48000
+stft:
+  n_fft: 2048
+  hop_length: 640
+  win_length: 2048
+token_rate: 12
+crop_seconds: 1.5
+chunk_seconds: 1.5
+hop_seconds: 0.75
+batch_size: 8
+epochs: 2
+lr: 0.0001
+device: cuda
+num_workers: 4
+save_every: 1000
+model:
+  hidden_dim: 512
+  token_dim: 256
+  transformer_layers: 8
+  heads: 8
+train:
+  stage: 2
+  stage1_steps: 2000
+  stage2_steps: 10000
+  grad_clip: 1.0
+  use_amp: true
+  fsq_dropout_schedule:
+    - [0, 0.50]
+    - [5000, 0.65]
+    - [10000, 0.75]
+  ddp: false
+  use_checkpoint: true
+  ema:
+    enabled: true
+    decay: 0.9999
+data:
+  wav_exts: [".wav", ".flac", ".mp3"]
+  segment_seconds: 1.5
+  stereo: true
+output:
+  ckpt_dir: runs/ckpts
+  log_dir: runs/logs
+logging:
+  use_wandb: false
+  project: lycodec
+  run_name: lycodec_48k
+teacher:
+  primary:
+    enabled: false
+    type: mert
+    model_name: m-a-p/MERT-v1-330M
+    sample_rate: 24000
+    feature_hz: 75
+    align_weight: 0.1
+    window_sec: 0.4
+  aux:
+    enabled: false
+    type: mhubert
+    model_name: utter-project/mHuBERT-147
+    sample_rate: 16000
+    feature_hz: 50
+    align_weight: 0.05
+    window_sec: 0.4

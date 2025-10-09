@@ -1,0 +1,10 @@
+torch
+torchaudio
+einops
+soundfile
+librosa
+numpy
+PyYAML
+tqdm
+wandb
+transformers
