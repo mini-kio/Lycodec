@@ -20,6 +20,9 @@ model:
   heads: 8
   use_rope: true
   use_group_fsq: true
+  # Transformer Decoder configuration
+  decoder_depth: 6          # Number of transformer decoder layers (4-8 recommended)
+  decoder_patch_size: 16    # Patch size (8=more detail/slower, 16=balanced, 32=faster/less detail)
 train:
   # Single-stage training: consistency from step 0
   stage: 2

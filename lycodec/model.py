@@ -10,16 +10,17 @@ from lycodec.core.blocks import (
     HybridLatent,
     StereoHead,
 )
-from lycodec.core.decoders import TokenConditioner, UNet2D, BandSplitHead, edm_parameterization
+from lycodec.core.decoders import TokenConditioner, TransformerDecoder2D, BandSplitHead, edm_parameterization
 
 
 class Lycodec(nn.Module):
-    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False, use_rope=True, use_group_fsq=True):
+    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False, use_rope=True, use_group_fsq=True, decoder_depth=6, decoder_patch_size=16):
         super().__init__()
         self.sr = sr
         self.n_fft = n_fft
         self.hop = hop
         self.win = win
+
         self.patch = Patchifier(c_in=4, widths=(64, 128, 256, 512))
         self.enc_proj = nn.Conv2d(512, hidden, 1)
         # temporal_down removed - using resampler directly
@@ -39,7 +40,22 @@ class Lycodec(nn.Module):
         self.stereo = StereoHead(dim=token_dim)
 
         self.cond = TokenConditioner(token_dim=token_dim, cond_ch=64, t_out=113, f_bins=self.n_fft // 2 + 1)
-        self.unet = UNet2D(c_in=4, c_base=64, cond_ch=64)
+
+        # Transformer decoder
+        print(f"[Lycodec] Using TransformerDecoder2D (depth={decoder_depth}, patch_size={decoder_patch_size})")
+        self.decoder = TransformerDecoder2D(
+            c_in=68,  # 4 (spec) + 64 (cond)
+            c_out=4,
+            embed_dim=512,
+            depth=decoder_depth,
+            num_heads=8,
+            patch_size=decoder_patch_size,
+            token_dim=token_dim,
+            mlp_ratio=4.0,
+            dropout=0.0,
+            target_size=(self.n_fft // 2 + 1, 113),
+        )
+
         self.bands = BandSplitHead(c_in=4, sr=sr, n_fft=n_fft)
 
     def encode(self, wav):
@@ -105,8 +121,8 @@ class Lycodec(nn.Module):
         # Scale input
         spec_in = spec_noisy * c_in
 
-        # UNet prediction
-        F_theta = self.unet(spec_in, cond)
+        # Transformer decoder prediction with cross-attention
+        F_theta = self.decoder(spec_in, cond, tokens=tokens, sigma=sigma)
 
         # Consistency function: f(x_σ, σ) = c_skip * x_σ + c_out * F_θ(x_σ, σ)
         spec_pred = c_skip * spec_noisy + c_out * F_theta

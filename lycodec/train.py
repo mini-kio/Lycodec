@@ -189,7 +189,9 @@ def train(cfg_path, data_root):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    use_group_fsq=cfg["model"].get("use_group_fsq", True),)
+                    use_group_fsq=cfg["model"].get("use_group_fsq", True),
+                    decoder_depth=cfg["model"].get("decoder_depth", 6),
+                    decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),)
     model.to(device)
     if use_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
@@ -214,7 +216,9 @@ def train(cfg_path, data_root):
                                 heads=cfg["model"]["heads"],
                                 use_checkpoint=cfg["train"].get("use_checkpoint", False),
                                 use_rope=cfg["model"].get("use_rope", True),
-                                use_group_fsq=cfg["model"].get("use_group_fsq", True),).to(device)
+                                use_group_fsq=cfg["model"].get("use_group_fsq", True),
+                                decoder_depth=cfg["model"].get("decoder_depth", 6),
+                                decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),).to(device)
         teacher_model.eval()
         with torch.no_grad():
             ema.copy_to(teacher_model)
@@ -511,7 +515,9 @@ def load_model(ckpt_path, cfg_path):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    use_group_fsq=cfg["model"].get("use_group_fsq", True),)
+                    use_group_fsq=cfg["model"].get("use_group_fsq", True),
+                    decoder_depth=cfg["model"].get("decoder_depth", 6),
+                    decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),)
     if ckpt_path and os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(sd["model"], strict=False)
