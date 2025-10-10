@@ -14,7 +14,8 @@ from lycodec.utils.teacher import TeacherStub, MERTTeacher, MHuBERTTeacher
 
 
 def load_config(path):
-    with open(path, "r") as f:
+    # Ensure UTF-8 decoding for configs with non-ASCII comments/keys
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -45,7 +46,9 @@ class EMA:
 def setup_ddp(enable=False):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if enable and world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        # Use NCCL only on non-Windows platforms with CUDA available; otherwise fall back to gloo
+        use_nccl = (os.name != "nt") and torch.cuda.is_available()
+        dist.init_process_group(backend="nccl" if use_nccl else "gloo")
         return True
     return False
 
@@ -184,7 +187,9 @@ def train(cfg_path, data_root):
                     hidden=cfg["model"]["hidden_dim"],
                     layers=cfg["model"]["transformer_layers"],
                     heads=cfg["model"]["heads"],
-                    use_checkpoint=cfg["train"].get("use_checkpoint", False),)
+                    use_checkpoint=cfg["train"].get("use_checkpoint", False),
+                    use_rope=cfg["model"].get("use_rope", True),
+                    use_group_fsq=cfg["model"].get("use_group_fsq", True),)
     model.to(device)
     if use_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
@@ -207,7 +212,9 @@ def train(cfg_path, data_root):
                                 hidden=cfg["model"]["hidden_dim"],
                                 layers=cfg["model"]["transformer_layers"],
                                 heads=cfg["model"]["heads"],
-                                use_checkpoint=cfg["train"].get("use_checkpoint", False),).to(device)
+                                use_checkpoint=cfg["train"].get("use_checkpoint", False),
+                                use_rope=cfg["model"].get("use_rope", True),
+                                use_group_fsq=cfg["model"].get("use_group_fsq", True),).to(device)
         teacher_model.eval()
         with torch.no_grad():
             ema.copy_to(teacher_model)
@@ -237,59 +244,47 @@ def train(cfg_path, data_root):
                     set_fsq_dropout(model.module if use_ddp else model, p)
                     break
 
-            # Stage selection and decoder freezing
-            stage1_steps = cfg["train"].get("stage1_steps", 0)
-            stage = 1 if total_steps < stage1_steps else 2
-
-            # Freeze/unfreeze decoder based on stage
+            # Single-stage training: always train full model with consistency from step 0
+            stage = 2
             model_obj = model.module if use_ddp else model
-            if stage == 1:
-                # Stage 1: Train encoder only, freeze decoder
-                for param in model_obj.cond.parameters():
-                    param.requires_grad = False
-                for param in model_obj.unet.parameters():
-                    param.requires_grad = False
-                for param in model_obj.bands.parameters():
-                    param.requires_grad = False
-            else:
-                # Stage 2: Train full model
-                for param in model_obj.cond.parameters():
-                    param.requires_grad = True
-                for param in model_obj.unet.parameters():
-                    param.requires_grad = True
-                for param in model_obj.bands.parameters():
-                    param.requires_grad = True
+            for param in model_obj.cond.parameters():
+                param.requires_grad = True
+            for param in model_obj.unet.parameters():
+                param.requires_grad = True
+            for param in model_obj.bands.parameters():
+                param.requires_grad = True
+
+            # STFT auxiliary loss weight schedule (only early N steps > 0)
+            stft_weight = 0.0
+            stft_sched = cfg["train"].get("recon_weight_schedule", [])
+            for step_thr, w in stft_sched[::-1]:
+                if total_steps >= step_thr:
+                    stft_weight = float(w)
+                    break
 
             if scaler is not None:
                 with torch.cuda.amp.autocast():
-                    rec, enc = model(wav, decode=(stage != 1))
+                    rec, enc = model(wav, decode=True)
                     # Initialize loss as torch tensor (not float!) to avoid AMP/backward errors
                     loss = torch.zeros((), device=device)
 
-                    # Stage-specific losses
-                    if stage == 1:
-                        # Stage 1: Focus on encoder training (no reconstruction loss)
-                        pass
-                    else:
-                        # Stage 2: Full training with consistency loss (use separate EMA teacher)
+                    # Main consistency loss (single-stage)
+                    loss_consistency = consistency_loss(
+                        model_obj,
+                        wav,
+                        enc["tokens"],
+                        enc["spec_clean"],
+                        sigma_min=cfg["train"].get("sigma_min", 0.002),
+                        sigma_max=cfg["train"].get("sigma_max", 80.0),
+                        rho=cfg["train"].get("rho", 7.0),
+                        ema_model=teacher_model if ema is not None else None,
+                    )
+                    loss = loss + loss_consistency
 
-                        # Consistency loss (main reconstruction loss)
-                        loss_consistency = consistency_loss(
-                            model_obj,
-                            wav,
-                            enc["tokens"],
-                            enc["spec_clean"],
-                            sigma_min=cfg["train"].get("sigma_min", 0.002),
-                            sigma_max=cfg["train"].get("sigma_max", 80.0),
-                            rho=cfg["train"].get("rho", 7.0),
-                            ema_model=teacher_model if ema is not None else None,
-                        )
-                        loss = loss + loss_consistency
-
-                        # Additional STFT loss (lower weight)
-                        if rec is not None:
-                            loss_stft = stft_loss(rec, wav, cfg)
-                            loss = loss + 0.1 * loss_stft
+                    # Optional STFT reconstruction loss with scheduled weight
+                    if rec is not None and stft_weight > 0:
+                        loss_stft = stft_loss(rec, wav, cfg)
+                        loss = loss + stft_weight * loss_stft
                     # Local attention alignment: primary (MERT)
                     # Higher weight in Stage 1, lower in Stage 2
                     if cfg.get("teacher", {}).get("primary", {}).get("enabled", False) and primary is not None:
@@ -309,12 +304,8 @@ def train(cfg_path, data_root):
                             opt.add_param_group({"params": align_proj_p.parameters(), "lr": cfg["lr"]})
                         s_proj, t_proj = align_proj_p(enc["tokens"], tfeat)
 
-                        # Stage-dependent weighting
+                        # Use configured alignment weight directly (single-stage)
                         align_weight = cfg["teacher"]["primary"].get("align_weight", 0.1)
-                        if stage == 1:
-                            align_weight = align_weight * 1.0  # Full weight in Stage 1
-                        else:
-                            align_weight = align_weight * 0.1  # Reduced weight in Stage 2
 
                         loss = loss + align_weight * \
                                local_attention_align(s_proj, t_proj,
@@ -340,12 +331,8 @@ def train(cfg_path, data_root):
                             opt.add_param_group({"params": align_proj_a.parameters(), "lr": cfg["lr"]})
                         s_proj, t_proj = align_proj_a(enc["tokens"], tfeat)
 
-                        # Stage-dependent weighting
+                        # Use configured alignment weight directly (single-stage)
                         align_weight = cfg["teacher"]["aux"].get("align_weight", 0.05)
-                        if stage == 1:
-                            align_weight = align_weight * 1.0  # Full weight in Stage 1
-                        else:
-                            align_weight = align_weight * 0.3  # Reduced weight in Stage 2
 
                         loss = loss + align_weight * \
                                local_attention_align(s_proj, t_proj,
@@ -390,11 +377,24 @@ def train(cfg_path, data_root):
                     total_steps += 1
             else:
                 # Non-AMP path (no scaler)
-                rec, enc = model(wav, decode=(stage != 1))
-                loss = 0.0
-                # Stage 2: use STFT reconstruction loss
-                if stage != 1 and rec is not None:
-                    loss = loss + stft_loss(rec, wav, cfg)
+                rec, enc = model(wav, decode=True)
+                loss = torch.zeros((), device=device)
+                # Main consistency loss
+                loss_consistency = consistency_loss(
+                    model_obj,
+                    wav,
+                    enc["tokens"],
+                    enc["spec_clean"],
+                    sigma_min=cfg["train"].get("sigma_min", 0.002),
+                    sigma_max=cfg["train"].get("sigma_max", 80.0),
+                    rho=cfg["train"].get("rho", 7.0),
+                    ema_model=teacher_model if ema is not None else None,
+                )
+                loss = loss + loss_consistency
+
+                # Optional STFT reconstruction with scheduled weight
+                if rec is not None and stft_weight > 0:
+                    loss = loss + stft_weight * stft_loss(rec, wav, cfg)
 
                 # Local attention alignment: primary (MERT)
                 if cfg.get("teacher", {}).get("primary", {}).get("enabled", False) and primary is not None:
@@ -413,7 +413,6 @@ def train(cfg_path, data_root):
                         opt.add_param_group({"params": align_proj_p.parameters(), "lr": cfg["lr"]})
                     s_proj, t_proj = align_proj_p(enc["tokens"], tfeat)
                     align_weight = cfg["teacher"]["primary"].get("align_weight", 0.1)
-                    align_weight = align_weight * (1.0 if stage == 1 else 0.1)
                     loss = loss + align_weight * \
                            local_attention_align(s_proj, t_proj,
                                                  teacher_hz=cfg["teacher"]["primary"].get("feature_hz", 75),
@@ -437,7 +436,6 @@ def train(cfg_path, data_root):
                         opt.add_param_group({"params": align_proj_a.parameters(), "lr": cfg["lr"]})
                     s_proj, t_proj = align_proj_a(enc["tokens"], tfeat)
                     align_weight = cfg["teacher"]["aux"].get("align_weight", 0.05)
-                    align_weight = align_weight * (1.0 if stage == 1 else 0.3)
                     loss = loss + align_weight * \
                            local_attention_align(s_proj, t_proj,
                                                  teacher_hz=cfg["teacher"]["aux"].get("feature_hz", 50),
@@ -511,7 +509,9 @@ def load_model(ckpt_path, cfg_path):
                     hidden=cfg["model"]["hidden_dim"],
                     layers=cfg["model"]["transformer_layers"],
                     heads=cfg["model"]["heads"],
-                    use_checkpoint=cfg["train"].get("use_checkpoint", False),)
+                    use_checkpoint=cfg["train"].get("use_checkpoint", False),
+                    use_rope=cfg["model"].get("use_rope", True),
+                    use_group_fsq=cfg["model"].get("use_group_fsq", True),)
     if ckpt_path and os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(sd["model"], strict=False)

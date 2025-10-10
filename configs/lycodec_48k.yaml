@@ -18,9 +18,12 @@ model:
   token_dim: 256
   transformer_layers: 8
   heads: 8
+  use_rope: true
+  use_group_fsq: true
 train:
+  # Single-stage training: consistency from step 0
   stage: 2
-  stage1_steps: 2000
+  stage1_steps: 0
   stage2_steps: 10000
   grad_clip: 1.0
   use_amp: true
@@ -33,6 +36,11 @@ train:
   ema:
     enabled: true
     decay: 0.9999
+  # STFT 보조 손실 가중 스케줄(초반 N step만 가중 적용)
+  # 예: 0~2000 step: 0.1, 그 이후: 0.0
+  recon_weight_schedule:
+    - [0, 0.1]
+    - [2000, 0.0]
 data:
   wav_exts: [".wav", ".flac", ".mp3"]
   segment_seconds: 1.5
@@ -46,7 +54,7 @@ logging:
   run_name: lycodec_48k
 teacher:
   primary:
-    enabled: false
+    enabled: true
     type: mert
     model_name: m-a-p/MERT-v1-330M
     sample_rate: 24000
@@ -54,9 +62,9 @@ teacher:
     align_weight: 0.1
     window_sec: 0.4
   aux:
-    enabled: false
-    type: mhubert
-    model_name: utter-project/mHuBERT-147
+    enabled: true
+    type: hubert
+    model_name: ZhenYe234/hubert_base_general_audio
     sample_rate: 16000
     feature_hz: 50
     align_weight: 0.05

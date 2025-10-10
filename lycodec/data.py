@@ -47,6 +47,10 @@ class StereoCropDataset(Dataset):
         if self.use_teacher_cache and self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
 
+        # Fail early with a clear error if no audio files are found
+        if len(self.files) == 0:
+            raise ValueError(f"No audio files found under '{root}' with extensions {exts}.")
+
     def _get_cache_path(self, file_path, teacher_name):
         """Generate cache file path based on audio file path and teacher name."""
         file_hash = hashlib.md5(file_path.encode()).hexdigest()[:16]
@@ -82,7 +86,7 @@ class StereoCropDataset(Dataset):
                 pass
 
     def __len__(self):
-        return max(1, len(self.files))
+        return len(self.files)
 
     def __getitem__(self, idx):
         f = self.files[idx % len(self.files)]

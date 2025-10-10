@@ -6,6 +6,7 @@ from lycodec.core.blocks import (
     TransformerEncoder,
     TemporalResampler,
     FSQQuantizer,
+    GroupFSQ,
     HybridLatent,
     StereoHead,
 )
@@ -13,7 +14,7 @@ from lycodec.core.decoders import TokenConditioner, UNet2D, BandSplitHead, edm_p
 
 
 class Lycodec(nn.Module):
-    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False):
+    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False, use_rope=True, use_group_fsq=True):
         super().__init__()
         self.sr = sr
         self.n_fft = n_fft
@@ -23,9 +24,17 @@ class Lycodec(nn.Module):
         self.enc_proj = nn.Conv2d(512, hidden, 1)
         # temporal_down removed - using resampler directly
         self.resampler = TemporalResampler(hidden, t_out=18)
-        self.encoder = TransformerEncoder(dim=hidden, depth=layers, heads=heads, use_checkpoint=use_checkpoint)
+        self.encoder = TransformerEncoder(dim=hidden, depth=layers, heads=heads, use_checkpoint=use_checkpoint, use_rope=use_rope)
         self.to_token = nn.Linear(hidden, token_dim)
-        self.fsq = FSQQuantizer(levels=11, dim=token_dim, dropout_p=0.65)
+
+        # Use GroupFSQ by default (4 groups with 11 levels each)
+        if use_group_fsq:
+            print("[Lycodec] Using Group FSQ with 4 groups")
+            self.fsq = GroupFSQ(num_groups=4, levels=[11, 11, 11, 11], dim=token_dim, dropout_p=0.65)
+        else:
+            print("[Lycodec] Using standard FSQ")
+            self.fsq = FSQQuantizer(levels=11, dim=token_dim, dropout_p=0.65)
+
         self.hybrid = HybridLatent(dim=token_dim)
         self.stereo = StereoHead(dim=token_dim)
 

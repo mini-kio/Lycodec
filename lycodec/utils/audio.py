@@ -80,7 +80,8 @@ def spec_unpack(spec):
 
 def amp_phase_transform(spec, beta=1.0, p=0.5):
     a = torch.clamp(spec.abs(), 1e-8) ** p
-    ang = torch.atan2(spec[..., 1], spec[..., 0]) if spec.is_complex() else 0
+    # Use torch.is_complex to check dtype reliably
+    ang = torch.atan2(spec[..., 1], spec[..., 0]) if torch.is_complex(spec) else 0
     return a, ang
 
 

@@ -1,7 +1,6 @@
 __all__ = [
-    "audio",
-    "modules",
+    "core",
+    "utils",
     "model",
-    "losses",
     "data",
 ]
