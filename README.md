@@ -2,7 +2,7 @@
 
 A high-quality neural audio codec for 48kHz stereo audio using Group Finite Scalar Quantization (Group FSQ) and Rotary Position Embeddings (RoPE).
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 
@@ -626,7 +626,7 @@ If you use Lycodec in your research, please cite:
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+Apache-2.0 License - see [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
