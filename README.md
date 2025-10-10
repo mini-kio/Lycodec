@@ -204,8 +204,8 @@ Tokens [B, 18, 256]
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/lycodec.git
-cd lycodec
+git clone https://github.com/mini-kio/Lycodec.git
+cd Lycodec
 
 # Install dependencies
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
@@ -574,9 +574,9 @@ If you use Lycodec in your research, please cite:
 ```bibtex
 @misc{lycodec2024,
   title={Lycodec: Neural Audio Codec with Group FSQ and RoPE},
-  author={Your Name},
+  author={mini-kio},
   year={2024},
-  howpublished={\url{https://github.com/yourusername/lycodec}}
+  howpublished={\url{https://github.com/mini-kio/Lycodec}}
 }
 ```
 
@@ -648,8 +648,8 @@ Contributions are welcome! Please:
 ## Contact
 
 For questions or issues:
-- GitHub Issues: [https://github.com/yourusername/lycodec/issues](https://github.com/yourusername/lycodec/issues)
-- Email: your.email@example.com
+- GitHub Issues: [https://github.com/mini-kio/Lycodec/issues](https://github.com/mini-kio/Lycodec/issues)
+- Email: kiolaaoz@naver.com
 
 ---
 
