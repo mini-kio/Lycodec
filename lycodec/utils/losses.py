@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import math
 
@@ -141,3 +142,154 @@ def consistency_loss(model, wav, tokens, spec_clean, sigma_min=0.002, sigma_max=
     loss = loss / (delta_sigma.mean() + 1e-8)
 
     return loss
+
+
+def commitment_loss(z_cont, z_disc):
+    """
+    VQ-VAE commitment loss: encourage encoder to commit to codes.
+
+    L_commit = ||z_cont - sg(z_disc)||^2
+    """
+    if z_disc is None:
+        return torch.tensor(0.0, device=z_cont.device)
+    return F.mse_loss(z_cont, z_disc.detach())
+
+
+def codebook_usage_loss(model):
+    """
+    Regularize codebook to use all codes uniformly.
+
+    Prevents "codebook collapse" where only few codes are used.
+    Encourages high entropy (uniform distribution) in code usage.
+
+    Args:
+        model: Lycodec model with FSQ quantizer
+
+    Returns:
+        usage loss (lower = more uniform usage)
+    """
+    model_obj = model.module if hasattr(model, 'module') else model
+
+    if not hasattr(model_obj, 'fsq'):
+        return torch.tensor(0.0, device=next(model_obj.parameters()).device)
+
+    fsq = model_obj.fsq
+    usage = None
+
+    if hasattr(fsq, 'codebook_usage'):
+        usage = fsq.codebook_usage
+    elif hasattr(fsq, 'semantic_fsq') and hasattr(fsq.semantic_fsq, 'codebook_usage'):
+        usage = fsq.semantic_fsq.codebook_usage
+
+    if usage is None:
+        return torch.tensor(0.0, device=next(model_obj.parameters()).device)
+
+    num_groups, num_codes = usage.shape
+    device = usage.device
+
+    loss = torch.tensor(0.0, device=device)
+    for i in range(num_groups):
+        prob = usage[i] / (usage[i].sum() + 1e-8)
+        entropy = -torch.sum(prob * torch.log(prob + 1e-8))
+        max_entropy = math.log(num_codes)
+        loss = loss + (max_entropy - entropy)
+
+    return loss / num_groups
+
+
+def acoustic_prediction_loss(enc):
+    if 'acoustic_residual' not in enc or enc['acoustic_residual'] is None:
+        return torch.tensor(0.0, device=enc['tokens'].device)
+
+    residual = enc['acoustic_residual']
+    loss = (residual ** 2).mean()
+
+    return loss
+
+
+def semantic_ar_loss(model, enc):
+    model_obj = model.module if hasattr(model, 'module') else model
+    device = enc['tokens'].device
+
+    if not model_obj.use_partitioned_fsq:
+        return torch.tensor(0.0, device=device)
+
+    if enc['semantic_disc'] is None:
+        return torch.tensor(0.0, device=device)
+
+    semantic = enc['semantic_disc']
+    B, T, semantic_dim = semantic.shape
+
+    num_groups = 4
+    group_dim = semantic_dim // num_groups
+
+    groups = list(semantic.chunk(num_groups, dim=-1))
+
+    loss = torch.tensor(0.0, device=device)
+
+    for i in range(1, num_groups):
+        predictor_name = f'semantic_ar_predictor_{i}'
+        if not hasattr(model_obj, predictor_name):
+            input_dim = i * group_dim
+            predictor = nn.Sequential(
+                nn.Linear(input_dim, group_dim * 2),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(group_dim * 2, group_dim),
+            ).to(device)
+            model_obj.register_module(predictor_name, predictor)
+
+        predictor = getattr(model_obj, predictor_name)
+
+        prev_groups = torch.cat(groups[:i], dim=-1)
+
+        target_group = groups[i].detach()
+
+        pred = predictor(prev_groups)
+
+        loss = loss + F.mse_loss(pred, target_group)
+
+    return loss / (num_groups - 1)
+
+
+def masked_token_prediction_loss(model, wav, mask_ratio=0.15):
+    model_obj = model.module if hasattr(model, 'module') else model
+    device = wav.device
+
+    with torch.no_grad():
+        enc = model_obj.encode(wav)
+
+    tokens = enc["tokens"]
+    B, T, D = tokens.shape
+
+    if not hasattr(model_obj, 'mask_token'):
+        model_obj.mask_token = torch.nn.Parameter(
+            torch.randn(1, 1, D, device=device) * 0.02
+        )
+        model_obj.register_parameter('mask_token', model_obj.mask_token)
+
+    if not hasattr(model_obj, 'mask_predictor'):
+        model_obj.mask_predictor = torch.nn.Sequential(
+            torch.nn.Linear(D, D * 2),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(D * 2, D),
+        ).to(device)
+
+    num_mask = max(1, int(T * mask_ratio))
+    mask_indices = torch.rand(B, T, device=device).argsort(dim=1)[:, :num_mask]
+
+    tokens_masked = tokens.clone()
+    batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, num_mask)
+    tokens_masked[batch_indices, mask_indices] = model_obj.mask_token
+
+    predicted = model_obj.mask_predictor(tokens_masked)
+
+    target = tokens.detach()
+    loss = torch.tensor(0.0, device=device)
+    for b in range(B):
+        masked_pred = predicted[b, mask_indices[b]]
+        masked_target = target[b, mask_indices[b]]
+        loss = loss + F.mse_loss(masked_pred, masked_target)
+
+    return loss / B

@@ -9,8 +9,15 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import torch.distributed as dist
 from lycodec.data import StereoCropDataset
 from lycodec.model import Lycodec
-from lycodec.utils.losses import stft_loss, consistency_loss
-from lycodec.utils.teacher import TeacherStub, MERTTeacher, MHuBERTTeacher
+from lycodec.utils.losses import (
+    stft_loss,
+    consistency_loss,
+    commitment_loss,
+    codebook_usage_loss,
+    masked_token_prediction_loss,
+    acoustic_prediction_loss,
+    semantic_ar_loss
+)
 
 
 def load_config(path):
@@ -59,33 +66,12 @@ def is_master():
 
 def set_fsq_dropout(model, p):
     if hasattr(model, "fsq"):
-        model.fsq.dropout_p = p
+        if hasattr(model.fsq, "semantic_fsq"):
+            model.fsq.semantic_fsq.dropout_p = p
+        elif hasattr(model.fsq, "dropout_p"):
+            model.fsq.dropout_p = p
 
 
-def get_teachers(cfg, device):
-    prim = cfg.get("teacher", {}).get("primary", {})
-    aux = cfg.get("teacher", {}).get("aux", {})
-    # primary
-    if prim.get("enabled", False) and prim.get("type", "").lower() == "mert":
-        try:
-            primary = MERTTeacher(prim.get("model_name"), device=device)
-        except Exception as e:
-            if is_master():
-                print(f"[teacher/primary] fallback stub: {e}")
-            primary = TeacherStub(dim=cfg["model"]["token_dim"])  # fallback
-    else:
-        primary = None
-    # aux
-    if aux.get("enabled", False) and aux.get("type", "").lower() in ("mhubert", "hubert"):
-        try:
-            secondary = MHuBERTTeacher(aux.get("model_name"), device=device)
-        except Exception as e:
-            if is_master():
-                print(f"[teacher/aux] fallback stub: {e}")
-            secondary = TeacherStub(dim=cfg["model"]["token_dim"])  # fallback
-    else:
-        secondary = None
-    return primary, secondary
 
 
 def tokenwise_ild(wav, tokens):
@@ -128,45 +114,6 @@ def stereo_metrics_inline(gt, pred):
         return {"ild_err_db": ild_err, "itc_err": itc_err}
 
 
-def local_attention_align(student, teacher, teacher_hz, student_hz=12, window_sec=0.4):
-    import torch
-    import torch.nn.functional as F
-    b, Ts, Ds = student.shape
-    Tt, Dt = teacher.shape[1], teacher.shape[2]
-    d = min(Ds, Dt)
-    S = F.normalize(student[..., :d], dim=-1)
-    T = F.normalize(teacher[..., :d], dim=-1)
-    ratio = float(teacher_hz) / float(student_hz)
-    w = max(1, int(window_sec * teacher_hz / 2))
-    loss = 0.0
-    count = 0
-    for i in range(Ts):
-        center = int(round(i * ratio))
-        s = max(0, center - w)
-        e = min(Tt, center + w + 1)
-        if e <= s:
-            continue
-        q = S[:, i, :]
-        k = T[:, s:e, :]
-        att = torch.einsum('bd,btd->bt', q, k)
-        att = F.softmax(att, dim=-1)
-        agg = torch.einsum('bt,btd->bd', att, k)
-        l = 1 - (F.normalize(q, dim=-1) * F.normalize(agg, dim=-1)).sum(dim=-1)
-        loss = loss + l.mean()
-        count += 1
-    return loss / max(1, count)
-
-
-class AlignProjector(nn.Module):
-    def __init__(self, d_s, d_t, d=None):
-        super().__init__()
-        if d is None:
-            d = min(d_s, d_t)
-        self.proj_s = nn.Linear(d_s, d, bias=False)
-        self.proj_t = nn.Linear(d_t, d, bias=False)
-
-    def forward(self, s, t):
-        return self.proj_s(s), self.proj_t(t)
 
 
 def train(cfg_path, data_root):
@@ -189,7 +136,8 @@ def train(cfg_path, data_root):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    use_group_fsq=cfg["model"].get("use_group_fsq", True),
+                    use_partitioned_fsq=cfg["model"].get("use_partitioned_fsq", True),
+                    semantic_dim=cfg["model"].get("semantic_dim", 120),
                     decoder_depth=cfg["model"].get("decoder_depth", 6),
                     decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),)
     model.to(device)
@@ -203,28 +151,6 @@ def train(cfg_path, data_root):
     total_steps = 0
     accum_iter = 0  # Track accumulation iterations
     ema = EMA(model.module if use_ddp else model, decay=cfg["train"]["ema"].get("decay", 0.9999)) if cfg["train"]["ema"].get("enabled", False) else None
-    # Separate teacher model for EMA weights (never trains)
-    teacher_model = None
-    if ema is not None:
-        teacher_model = Lycodec(sr=sr,
-                                n_fft=cfg["stft"]["n_fft"],
-                                hop=cfg["stft"]["hop_length"],
-                                win=cfg["stft"]["win_length"],
-                                token_dim=cfg["model"]["token_dim"],
-                                hidden=cfg["model"]["hidden_dim"],
-                                layers=cfg["model"]["transformer_layers"],
-                                heads=cfg["model"]["heads"],
-                                use_checkpoint=cfg["train"].get("use_checkpoint", False),
-                                use_rope=cfg["model"].get("use_rope", True),
-                                use_group_fsq=cfg["model"].get("use_group_fsq", True),
-                                decoder_depth=cfg["model"].get("decoder_depth", 6),
-                                decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),).to(device)
-        teacher_model.eval()
-        with torch.no_grad():
-            ema.copy_to(teacher_model)
-    primary, secondary = get_teachers(cfg, device)
-    align_proj_p = None
-    align_proj_a = None
 
     if cfg["logging"]["use_wandb"] and is_master():
         try:
@@ -281,7 +207,7 @@ def train(cfg_path, data_root):
                         sigma_min=cfg["train"].get("sigma_min", 0.002),
                         sigma_max=cfg["train"].get("sigma_max", 80.0),
                         rho=cfg["train"].get("rho", 7.0),
-                        ema_model=teacher_model if ema is not None else None,
+                        ema_model=None,
                     )
                     loss = loss + loss_consistency
 
@@ -289,60 +215,45 @@ def train(cfg_path, data_root):
                     if rec is not None and stft_weight > 0:
                         loss_stft = stft_loss(rec, wav, cfg)
                         loss = loss + stft_weight * loss_stft
-                    # Local attention alignment: primary (MERT)
-                    # Higher weight in Stage 1, lower in Stage 2
-                    if cfg.get("teacher", {}).get("primary", {}).get("enabled", False) and primary is not None:
-                        mid = wav[:, :1, :]
-                        tsr = cfg["teacher"]["primary"]["sample_rate"]
-                        if tsr != sr:
-                            import librosa
-                            mw = mid.squeeze(1).detach().cpu().numpy()
-                            mw = librosa.resample(mw, orig_sr=sr, target_sr=tsr, res_type="kaiser_fast", axis=1)
-                            mw = torch.from_numpy(mw).to(device)
-                        else:
-                            mw = mid.squeeze(1)
-                        tfeat = primary.forward(mw, sr=tsr)
-                        # build align projector lazily
-                        if align_proj_p is None:
-                            align_proj_p = AlignProjector(enc["tokens"].shape[-1], tfeat.shape[-1]).to(device)
-                            opt.add_param_group({"params": align_proj_p.parameters(), "lr": cfg["lr"]})
-                        s_proj, t_proj = align_proj_p(enc["tokens"], tfeat)
 
-                        # Use configured alignment weight directly (single-stage)
-                        align_weight = cfg["teacher"]["primary"].get("align_weight", 0.1)
+                    # ============================================
+                    # NEW: Semantic Learning Losses (Teacher-Free)
+                    # ============================================
 
-                        loss = loss + align_weight * \
-                               local_attention_align(s_proj, t_proj,
-                                                     teacher_hz=cfg["teacher"]["primary"].get("feature_hz", 75),
-                                                     student_hz=cfg.get("token_rate", 12),
-                                                     window_sec=cfg["teacher"]["primary"].get("window_sec", 0.4))
+                    # Codebook Regularization
+                    if cfg["train"].get("use_codebook_reg", True):
+                        # Commitment loss (semantic part only for PartitionedFSQ)
+                        if enc["disc"] is not None:
+                            if model_obj.use_partitioned_fsq and "semantic_cont" in enc:
+                                loss_commit = commitment_loss(enc["semantic_cont"], enc["semantic_disc"])
+                            else:
+                                loss_commit = commitment_loss(enc["cont"], enc["disc"])
+                            loss = loss + 0.25 * loss_commit
 
-                    # Local attention alignment: auxiliary (mHuBERT)
-                    # Higher weight in Stage 1, lower in Stage 2
-                    if cfg.get("teacher", {}).get("aux", {}).get("enabled", False) and secondary is not None:
-                        mid = wav[:, :1, :]
-                        tsr = cfg["teacher"]["aux"]["sample_rate"]
-                        if tsr != sr:
-                            import librosa
-                            mw = mid.squeeze(1).detach().cpu().numpy()
-                            mw = librosa.resample(mw, orig_sr=sr, target_sr=tsr, res_type="kaiser_fast", axis=1)
-                            mw = torch.from_numpy(mw).to(device)
-                        else:
-                            mw = mid.squeeze(1)
-                        tfeat = secondary.forward(mw, sr=tsr)
-                        if align_proj_a is None:
-                            align_proj_a = AlignProjector(enc["tokens"].shape[-1], tfeat.shape[-1]).to(device)
-                            opt.add_param_group({"params": align_proj_a.parameters(), "lr": cfg["lr"]})
-                        s_proj, t_proj = align_proj_a(enc["tokens"], tfeat)
+                        # Usage loss (prevent collapse)
+                        loss_usage = codebook_usage_loss(model)
+                        loss = loss + 0.01 * loss_usage
 
-                        # Use configured alignment weight directly (single-stage)
-                        align_weight = cfg["teacher"]["aux"].get("align_weight", 0.05)
+                    # Semantic-Acoustic losses
+                    if cfg["train"].get("use_semantic_acoustic", True):
+                        # Acoustic prediction loss
+                        loss_acoustic = acoustic_prediction_loss(enc)
+                        loss = loss + 0.3 * loss_acoustic
 
-                        loss = loss + align_weight * \
-                               local_attention_align(s_proj, t_proj,
-                                                     teacher_hz=cfg["teacher"]["aux"].get("feature_hz", 50),
-                                                     student_hz=cfg.get("token_rate", 12),
-                                                     window_sec=cfg["teacher"]["aux"].get("window_sec", 0.4))
+                        # Semantic AR loss
+                        loss_semantic_ar = semantic_ar_loss(model, enc)
+                        loss = loss + 0.2 * loss_semantic_ar
+
+                    # Masked Token Prediction
+                    if cfg["train"].get("use_masked_prediction", False):
+                        mask_ratio = cfg["train"].get("mask_ratio", 0.10)
+                        loss_masked = masked_token_prediction_loss(
+                            model,
+                            wav,
+                            mask_ratio=mask_ratio
+                        )
+                        mask_weight = cfg["train"].get("mask_weight", 0.05)
+                        loss = loss + mask_weight * loss_masked
 
                     # stereo head supervision (ILD)
                     try:
@@ -373,9 +284,6 @@ def train(cfg_path, data_root):
                     # EMA update (only after optimizer step)
                     if ema is not None:
                         ema.update(model.module if use_ddp else model)
-                        # Sync teacher model with EMA weights
-                        with torch.no_grad():
-                            ema.copy_to(teacher_model)
 
                     # Increment total_steps only after actual optimizer step
                     total_steps += 1
@@ -392,7 +300,7 @@ def train(cfg_path, data_root):
                     sigma_min=cfg["train"].get("sigma_min", 0.002),
                     sigma_max=cfg["train"].get("sigma_max", 80.0),
                     rho=cfg["train"].get("rho", 7.0),
-                    ema_model=teacher_model if ema is not None else None,
+                    ema_model=None,
                 )
                 loss = loss + loss_consistency
 
@@ -400,51 +308,35 @@ def train(cfg_path, data_root):
                 if rec is not None and stft_weight > 0:
                     loss = loss + stft_weight * stft_loss(rec, wav, cfg)
 
-                # Local attention alignment: primary (MERT)
-                if cfg.get("teacher", {}).get("primary", {}).get("enabled", False) and primary is not None:
-                    mid = wav[:, :1, :]
-                    tsr = cfg["teacher"]["primary"]["sample_rate"]
-                    if tsr != sr:
-                        import librosa
-                        mw = mid.squeeze(1).detach().cpu().numpy()
-                        mw = librosa.resample(mw, orig_sr=sr, target_sr=tsr, res_type="kaiser_fast", axis=1)
-                        mw = torch.from_numpy(mw).to(device)
-                    else:
-                        mw = mid.squeeze(1)
-                    tfeat = primary.forward(mw, sr=tsr)
-                    if align_proj_p is None:
-                        align_proj_p = AlignProjector(enc["tokens"].shape[-1], tfeat.shape[-1]).to(device)
-                        opt.add_param_group({"params": align_proj_p.parameters(), "lr": cfg["lr"]})
-                    s_proj, t_proj = align_proj_p(enc["tokens"], tfeat)
-                    align_weight = cfg["teacher"]["primary"].get("align_weight", 0.1)
-                    loss = loss + align_weight * \
-                           local_attention_align(s_proj, t_proj,
-                                                 teacher_hz=cfg["teacher"]["primary"].get("feature_hz", 75),
-                                                 student_hz=cfg.get("token_rate", 12),
-                                                 window_sec=cfg["teacher"]["primary"].get("window_sec", 0.4))
+                # ============================================
+                # NEW: Semantic Learning Losses (Teacher-Free)
+                # ============================================
 
-                # Local attention alignment: auxiliary (mHuBERT)
-                if cfg.get("teacher", {}).get("aux", {}).get("enabled", False) and secondary is not None:
-                    mid = wav[:, :1, :]
-                    tsr = cfg["teacher"]["aux"]["sample_rate"]
-                    if tsr != sr:
-                        import librosa
-                        mw = mid.squeeze(1).detach().cpu().numpy()
-                        mw = librosa.resample(mw, orig_sr=sr, target_sr=tsr, res_type="kaiser_fast", axis=1)
-                        mw = torch.from_numpy(mw).to(device)
-                    else:
-                        mw = mid.squeeze(1)
-                    tfeat = secondary.forward(mw, sr=tsr)
-                    if align_proj_a is None:
-                        align_proj_a = AlignProjector(enc["tokens"].shape[-1], tfeat.shape[-1]).to(device)
-                        opt.add_param_group({"params": align_proj_a.parameters(), "lr": cfg["lr"]})
-                    s_proj, t_proj = align_proj_a(enc["tokens"], tfeat)
-                    align_weight = cfg["teacher"]["aux"].get("align_weight", 0.05)
-                    loss = loss + align_weight * \
-                           local_attention_align(s_proj, t_proj,
-                                                 teacher_hz=cfg["teacher"]["aux"].get("feature_hz", 50),
-                                                 student_hz=cfg.get("token_rate", 12),
-                                                 window_sec=cfg["teacher"]["aux"].get("window_sec", 0.4))
+                # Codebook Regularization
+                if cfg["train"].get("use_codebook_reg", True):
+                    if enc["disc"] is not None:
+                        if model_obj.use_partitioned_fsq and "semantic_cont" in enc:
+                            loss_commit = commitment_loss(enc["semantic_cont"], enc["semantic_disc"])
+                        else:
+                            loss_commit = commitment_loss(enc["cont"], enc["disc"])
+                        loss = loss + 0.25 * loss_commit
+                    loss_usage = codebook_usage_loss(model)
+                    loss = loss + 0.01 * loss_usage
+
+                # Semantic-Acoustic losses
+                if cfg["train"].get("use_semantic_acoustic", True):
+                    loss_acoustic = acoustic_prediction_loss(enc)
+                    loss = loss + 0.3 * loss_acoustic
+
+                    loss_semantic_ar = semantic_ar_loss(model, enc)
+                    loss = loss + 0.2 * loss_semantic_ar
+
+                # Masked Token Prediction
+                if cfg["train"].get("use_masked_prediction", False):
+                    mask_ratio = cfg["train"].get("mask_ratio", 0.10)
+                    loss_masked = masked_token_prediction_loss(model, wav, mask_ratio=mask_ratio)
+                    mask_weight = cfg["train"].get("mask_weight", 0.05)
+                    loss = loss + mask_weight * loss_masked
 
                 # stereo head supervision (ILD)
                 try:
@@ -469,8 +361,6 @@ def train(cfg_path, data_root):
 
                     if ema is not None:
                         ema.update(model.module if use_ddp else model)
-                        with torch.no_grad():
-                            ema.copy_to(teacher_model)
 
                     total_steps += 1
             pbar.set_postfix({"loss": float(loss.item())})
@@ -515,10 +405,16 @@ def load_model(ckpt_path, cfg_path):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    use_group_fsq=cfg["model"].get("use_group_fsq", True),
+                    use_partitioned_fsq=cfg["model"].get("use_partitioned_fsq", True),
+                    semantic_dim=cfg["model"].get("semantic_dim", 120),
                     decoder_depth=cfg["model"].get("decoder_depth", 6),
                     decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),)
     if ckpt_path and os.path.exists(ckpt_path):
-        sd = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(sd["model"], strict=False)
+        sd = torch.load(ckpt_path, map_location="cpu")["model"]
+        from collections import OrderedDict
+        new_sd = OrderedDict()
+        for k, v in sd.items():
+            name = k.replace("module.", "") if k.startswith("module.") else k
+            new_sd[name] = v
+        model.load_state_dict(new_sd, strict=False)
     return model

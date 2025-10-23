@@ -19,10 +19,10 @@ model:
   transformer_layers: 8
   heads: 8
   use_rope: true
-  use_group_fsq: true
-  # Transformer Decoder configuration
-  decoder_depth: 6          # Number of transformer decoder layers (4-8 recommended)
-  decoder_patch_size: 16    # Patch size (8=more detail/slower, 16=balanced, 32=faster/less detail)
+  use_partitioned_fsq: true  # Use semantic-acoustic separation (replaces use_group_fsq)
+  semantic_dim: 120          # Semantic dimensions (120 dims = 2160 discrete values for 3min)
+  decoder_depth: 6
+  decoder_patch_size: 16
 train:
   # Single-stage training: consistency from step 0
   stage: 2
@@ -44,6 +44,8 @@ train:
   recon_weight_schedule:
     - [0, 0.1]
     - [2000, 0.0]
+  use_semantic_acoustic: true  # Enable semantic-acoustic losses
+  use_masked_prediction: false # Disable masked prediction (replaced by AR)
 data:
   wav_exts: [".wav", ".flac", ".mp3"]
   segment_seconds: 1.5
@@ -55,20 +57,3 @@ logging:
   use_wandb: false
   project: lycodec
   run_name: lycodec_48k
-teacher:
-  primary:
-    enabled: true
-    type: mert
-    model_name: m-a-p/MERT-v1-330M
-    sample_rate: 24000
-    feature_hz: 75
-    align_weight: 0.1
-    window_sec: 0.4
-  aux:
-    enabled: true
-    type: hubert
-    model_name: ZhenYe234/hubert_base_general_audio
-    sample_rate: 16000
-    feature_hz: 50
-    align_weight: 0.05
-    window_sec: 0.4

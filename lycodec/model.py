@@ -7,6 +7,7 @@ from lycodec.core.blocks import (
     TemporalResampler,
     FSQQuantizer,
     GroupFSQ,
+    PartitionedFSQ,
     HybridLatent,
     StereoHead,
 )
@@ -14,27 +15,27 @@ from lycodec.core.decoders import TokenConditioner, TransformerDecoder2D, BandSp
 
 
 class Lycodec(nn.Module):
-    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False, use_rope=True, use_group_fsq=True, decoder_depth=6, decoder_patch_size=16):
+    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False, use_rope=True, use_partitioned_fsq=True, semantic_dim=120, decoder_depth=6, decoder_patch_size=16):
         super().__init__()
         self.sr = sr
         self.n_fft = n_fft
         self.hop = hop
         self.win = win
+        self.token_dim = token_dim
+        self.use_partitioned_fsq = use_partitioned_fsq
 
         self.patch = Patchifier(c_in=4, widths=(64, 128, 256, 512))
         self.enc_proj = nn.Conv2d(512, hidden, 1)
-        # temporal_down removed - using resampler directly
         self.resampler = TemporalResampler(hidden, t_out=18)
         self.encoder = TransformerEncoder(dim=hidden, depth=layers, heads=heads, use_checkpoint=use_checkpoint, use_rope=use_rope)
         self.to_token = nn.Linear(hidden, token_dim)
 
-        # Use GroupFSQ by default (4 groups with 11 levels each)
-        if use_group_fsq:
+        if use_partitioned_fsq:
+            print("[Lycodec] Using Partitioned FSQ (Semantic-Acoustic separation)")
+            self.fsq = PartitionedFSQ(dim=token_dim, semantic_dim=semantic_dim, levels=11, dropout_p=0.65)
+        else:
             print("[Lycodec] Using Group FSQ with 4 groups")
             self.fsq = GroupFSQ(num_groups=4, levels=[11, 11, 11, 11], dim=token_dim, dropout_p=0.65)
-        else:
-            print("[Lycodec] Using standard FSQ")
-            self.fsq = FSQQuantizer(levels=11, dim=token_dim, dropout_p=0.65)
 
         self.hybrid = HybridLatent(dim=token_dim)
         self.stereo = StereoHead(dim=token_dim)
@@ -59,17 +60,41 @@ class Lycodec(nn.Module):
         self.bands = BandSplitHead(c_in=4, sr=sr, n_fft=n_fft)
 
     def encode(self, wav):
-        spec = wav_to_spec(wav, self.n_fft, self.hop, self.win)  # [B,4,F,T]
-        z, _ = self.patch(spec)  # skips not used (for future UNet skip connections)
+        spec = wav_to_spec(wav, self.n_fft, self.hop, self.win)
+        z, _ = self.patch(spec)
         z = self.enc_proj(z)
-        z = z.mean(dim=2)  # pool freq → [B, hidden, T']
-        z = self.resampler(z)  # [B, hidden, 18]
-        z = z.transpose(1, 2)  # [B, 18, hidden]
-        z = self.encoder(z)  # [B, 18, hidden]
-        z = self.to_token(z)  # [B, 18, token_dim]
-        z_cont, z_disc = self.fsq(z, self.training)
-        z_h, _ = self.hybrid(z_cont, z_disc if z_disc is not None else z_cont)
-        return {"tokens": z_h, "cont": z_cont, "disc": z_disc}
+        z = z.mean(dim=2)
+        z = self.resampler(z)
+        z = z.transpose(1, 2)
+        z = self.encoder(z)
+        z = self.to_token(z)
+
+        if self.use_partitioned_fsq:
+            fsq_out = self.fsq(z, self.training)
+            tokens = fsq_out['tokens']
+
+            cont_tokens = torch.cat([fsq_out['semantic_cont'], fsq_out['acoustic']], dim=-1)
+            if fsq_out['semantic_disc'] is not None:
+                disc_tokens = torch.cat([fsq_out['semantic_disc'], fsq_out['acoustic']], dim=-1)
+            else:
+                disc_tokens = None
+
+            z_h, residual = self.hybrid(cont_tokens, disc_tokens if disc_tokens is not None else cont_tokens)
+
+            return {
+                "tokens": z_h,
+                "semantic_cont": fsq_out['semantic_cont'],
+                "semantic_disc": fsq_out['semantic_disc'],
+                "acoustic_pred": fsq_out['acoustic_pred'],
+                "acoustic_residual": fsq_out['acoustic_residual'],
+                "acoustic": fsq_out['acoustic'],
+                "cont": cont_tokens,
+                "disc": disc_tokens,
+            }
+        else:
+            z_cont, z_disc = self.fsq(z, self.training)
+            z_h, _ = self.hybrid(z_cont, z_disc if z_disc is not None else z_cont)
+            return {"tokens": z_h, "cont": z_cont, "disc": z_disc}
 
     def decode(self, tokens, length, sigma=None, spec_init=None):
         """

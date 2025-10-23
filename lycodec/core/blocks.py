@@ -217,6 +217,11 @@ class GroupFSQ(nn.Module):
         self.levels = levels
         self.N_values = [(L - 1) // 2 for L in levels]  # N for each group
 
+        # Codebook usage tracker for regularization
+        max_level = max(levels)
+        self.register_buffer('codebook_usage', torch.zeros(num_groups, max_level))
+        self.usage_decay = 0.99
+
         print(f"[GroupFSQ] Initialized with {num_groups} groups:")
         for i, (L, N) in enumerate(zip(self.levels, self.N_values)):
             print(f"  Group {i}: {self.group_dim} dims, {L} levels (N={N})")
@@ -261,13 +266,86 @@ class GroupFSQ(nn.Module):
 
         # Quantize each group with its own levels
         groups_q = []
-        for g_tanh, N in zip(groups_tanh, self.N_values):
+        for i, (g_tanh, N, L) in enumerate(zip(groups_tanh, self.N_values, self.levels)):
             g_q = torch.round(N * g_tanh) / N
+
+            # Track codebook usage (training only)
+            if training:
+                # Convert continuous [-1, 1] to discrete indices [0, L-1]
+                indices = ((g_tanh * N + N)).long().clamp(0, L - 1)
+                # Update usage counts
+                for idx in indices.flatten():
+                    if idx < self.codebook_usage.shape[1]:
+                        self.codebook_usage[i, idx] += 1
+
             g_q = g_tanh + (g_q - g_tanh).detach()
             groups_q.append(g_q)
 
         z_q = torch.cat(groups_q, dim=-1)
+
+        # Decay usage tracker (prevent overflow)
+        if training:
+            self.codebook_usage *= self.usage_decay
+
         return z_q, z_q
+
+
+class PartitionedFSQ(nn.Module):
+    def __init__(self, dim=256, semantic_dim=120, levels=11, dropout_p=0.65):
+        super().__init__()
+        self.dim = dim
+        self.semantic_dim = semantic_dim
+        self.acoustic_dim = dim - semantic_dim
+
+        assert semantic_dim % 4 == 0, f"semantic_dim ({semantic_dim}) must be divisible by 4"
+
+        self.semantic_fsq = GroupFSQ(
+            num_groups=4,
+            levels=[levels] * 4,
+            dim=semantic_dim,
+            dropout_p=dropout_p
+        )
+
+        self.acoustic_predictor = nn.Sequential(
+            nn.Linear(semantic_dim, semantic_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(semantic_dim * 2, self.acoustic_dim),
+        )
+
+        self.alpha = nn.Parameter(torch.ones(1) * 0.5)
+
+        print(f"[PartitionedFSQ] Semantic: {semantic_dim} dims, Acoustic: {self.acoustic_dim} dims")
+        print(f"[PartitionedFSQ] Total discrete values: 18 × {semantic_dim} = {18 * semantic_dim}")
+
+    def forward(self, z, training=True):
+        B, T, D = z.shape
+        assert D == self.dim, f"Input dim ({D}) doesn't match expected dim ({self.dim})"
+
+        semantic = z[..., :self.semantic_dim]
+        acoustic_gt = z[..., self.semantic_dim:]
+
+        semantic_cont, semantic_disc = self.semantic_fsq(semantic, training)
+
+        semantic_for_pred = semantic_disc if semantic_disc is not None else semantic_cont
+        acoustic_pred = self.acoustic_predictor(semantic_for_pred)
+
+        acoustic_residual = acoustic_gt - acoustic_pred.detach()
+        acoustic = acoustic_pred + self.alpha * acoustic_residual
+
+        if semantic_disc is not None:
+            tokens = torch.cat([semantic_disc, acoustic], dim=-1)
+        else:
+            tokens = torch.cat([semantic_cont, acoustic], dim=-1)
+
+        return {
+            'tokens': tokens,
+            'semantic_cont': semantic_cont,
+            'semantic_disc': semantic_disc,
+            'acoustic_pred': acoustic_pred,
+            'acoustic_residual': acoustic_residual,
+            'acoustic': acoustic,
+        }
 
 
 class HybridLatent(nn.Module):
