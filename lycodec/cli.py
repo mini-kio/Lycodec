@@ -74,13 +74,13 @@ def cmd_encode(args):
             enc = model.encode(chunk)
             toks.append(enc["tokens"].detach().cpu().numpy()[0])
 
-    tokens = np.stack(toks, axis=0)  # [N,18,D]
+    tokens = np.stack(toks, axis=0)  # [N,24,D] (24 fps)
     np.savez(args.out, tokens=tokens, sr=sr, length=T, seg=seg, hop=hop)
 
 
 def cmd_decode(args):
     data = np.load(args.tokens)
-    tokens = torch.from_numpy(data["tokens"]).float()  # [N,18,D] or [18,D]
+    tokens = torch.from_numpy(data["tokens"]).float()  # [N,24,D] or [24,D]
     length = int(data["length"]) if "length" in data else None
     seg = int(data["seg"]) if "seg" in data else None
     hop = int(data["hop"]) if "hop" in data else None
@@ -93,7 +93,7 @@ def cmd_decode(args):
     sr = cfg["sample_rate"]
 
     with torch.no_grad():
-        if tokens.ndim == 3:  # chunked [N, 18, D]
+        if tokens.ndim == 3:  # chunked [N, 24, D] (24 fps)
             N = tokens.shape[0]
             assert length is not None and seg is not None and hop is not None, \
                 "Chunked tokens require length, seg, hop metadata"
@@ -125,8 +125,8 @@ def cmd_decode(args):
                         out[:, s+hop:s+hop+tail] += wav[:, hop:hop+tail]
 
             wav = out.unsqueeze(0)
-        elif tokens.ndim == 2:  # single token [18, D] → add batch dimension
-            tokens = tokens.unsqueeze(0)  # [1, 18, D]
+        elif tokens.ndim == 2:  # single token [24, D] → add batch dimension
+            tokens = tokens.unsqueeze(0)  # [1, 24, D]
             if length is None:
                 length = int(1.5 * sr)  # default 1.5s
             wav = model.decode(tokens.to(device), length)

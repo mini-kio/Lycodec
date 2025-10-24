@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from lycodec.utils.audio import resample_time
 
@@ -80,7 +81,7 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, dim=512, depth=8, heads=8, dropout=0.1, use_checkpoint=False, seq_len=18, chunk_size=9, use_rope=True):
+    def __init__(self, dim=512, depth=8, heads=8, dropout=0.1, use_checkpoint=False, seq_len=18, chunk_size=None, use_rope=True):
         super().__init__()
 
         # Initialize RoPE (shared across all blocks)
@@ -99,10 +100,11 @@ class TransformerEncoder(nn.Module):
 
         self.use_checkpoint = use_checkpoint
         self.seq_len = seq_len
-        self.chunk_size = chunk_size
+        # Auto chunk_size = half of seq_len
+        self.chunk_size = chunk_size if chunk_size is not None else seq_len // 2
 
         # Create chunked causal mask (left/right chunks)
-        self.register_buffer("chunked_mask", self._create_chunked_causal_mask(seq_len, chunk_size))
+        self.register_buffer("chunked_mask", self._create_chunked_causal_mask(seq_len, self.chunk_size))
 
     def _create_chunked_causal_mask(self, seq_len, chunk_size):
         """
@@ -346,6 +348,305 @@ class PartitionedFSQ(nn.Module):
             'acoustic_residual': acoustic_residual,
             'acoustic': acoustic,
         }
+
+
+class RVQQuantizer(nn.Module):
+    """
+    Residual Vector Quantizer with EMA update and dead code awakening.
+
+    Single-layer RVQ (C=1) with K=4096 codebook for coarse tokens.
+    LLM will predict these discrete indices.
+
+    Features:
+    - EMA codebook update (decay 0.99)
+    - Dead code awakening (reinitialize unused codes)
+    - Gumbel-Softmax straight-through (training)
+    - Sampled softmax for large-K stability
+    - Usage tracking for regularization
+
+    NEW: A-plan dropout trio for robustness without FSQ
+    - Mask dropout: replace tokens with learnable <MASK>
+    - Embedding jitter: add noise to codebook vectors
+    - Pre-quant bypass: use continuous latent directly
+    """
+    def __init__(self, dim=256, codebook_size=4096, ema_decay=0.99, awakening_steps=2000, gumbel_temp=1.0,
+                 p_mask=0.10, p_jitter=0.20, p_bypass=0.20, jitter_sigma=0.07):
+        super().__init__()
+        self.dim = dim
+        self.K = codebook_size
+        self.ema_decay = ema_decay
+        self.awakening_steps = awakening_steps
+        self.gumbel_temp = gumbel_temp
+
+        # Dropout probabilities (will be scheduled during training)
+        self.p_mask = p_mask
+        self.p_jitter = p_jitter
+        self.p_bypass = p_bypass
+        self.jitter_sigma = jitter_sigma
+
+        # Codebook [K, D]
+        self.register_buffer('codebook', torch.randn(codebook_size, dim))
+        self.register_buffer('codebook_usage', torch.zeros(codebook_size))
+        self.register_buffer('step_counter', torch.zeros(1, dtype=torch.long))
+
+        # EMA cluster size for stable updates
+        self.register_buffer('ema_cluster_size', torch.zeros(codebook_size))
+        self.register_buffer('ema_embed_avg', torch.zeros(codebook_size, dim))
+
+        # Learnable mask token for mask dropout
+        self.mask_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+
+        # Pre-quant bypass projection (continuous latent → codebook dim)
+        self.bypass_proj = nn.Conv1d(dim, dim, 1)
+
+        # Projection for logit computation (optional, for sampled softmax)
+        self.use_projection = codebook_size > 2048
+        if self.use_projection:
+            self.logit_proj = nn.Linear(dim, 512)
+            self.codebook_proj = nn.Linear(dim, 512)
+
+        print(f"[RVQ] Initialized: K={codebook_size}, dim={dim}, EMA decay={ema_decay}")
+        print(f"[RVQ] Awakening after {awakening_steps} steps, Gumbel temp={gumbel_temp}")
+        print(f"[RVQ] Dropout trio: p_mask={p_mask}, p_jitter={p_jitter}, p_bypass={p_bypass}")
+
+    def _init_codebook_kmeans(self, z):
+        """Initialize codebook with k-means on first batch."""
+        # Simple random sampling for now; can be improved with k-means
+        B, T, D = z.shape
+        z_flat = z.reshape(-1, D)
+        indices = torch.randperm(z_flat.shape[0])[:self.K]
+        self.codebook.copy_(z_flat[indices])
+
+    def _compute_distances(self, z):
+        """Compute L2 distances to codebook. [B, T, K]"""
+        # z: [B, T, D]
+        # codebook: [K, D]
+        z_flat = z.reshape(-1, self.dim)  # [B*T, D]
+
+        # ||z - e||^2 = ||z||^2 - 2*z·e + ||e||^2
+        z_norm_sq = (z_flat ** 2).sum(dim=-1, keepdim=True)  # [B*T, 1]
+        e_norm_sq = (self.codebook ** 2).sum(dim=-1, keepdim=True).t()  # [1, K]
+        dot_product = z_flat @ self.codebook.t()  # [B*T, K]
+
+        distances = z_norm_sq + e_norm_sq - 2 * dot_product  # [B*T, K]
+        return distances.reshape(z.shape[0], z.shape[1], self.K)  # [B, T, K]
+
+    def _gumbel_softmax_st(self, logits, tau):
+        """Gumbel-Softmax straight-through estimator."""
+        # Sample Gumbel noise
+        gumbel = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+        logits_with_gumbel = (logits + gumbel) / tau
+
+        # Softmax
+        soft_codes = F.softmax(logits_with_gumbel, dim=-1)
+
+        # Hard indices (straight-through)
+        indices = soft_codes.argmax(dim=-1)
+        hard_codes = F.one_hot(indices, num_classes=self.K).float()
+
+        # ST gradient: forward hard, backward soft
+        codes = hard_codes - soft_codes.detach() + soft_codes
+        return codes, indices
+
+    def _update_ema(self, z, indices):
+        """EMA codebook update."""
+        if not self.training:
+            return
+
+        B, T = indices.shape
+        z_flat = z.reshape(-1, self.dim)  # [B*T, D]
+        indices_flat = indices.reshape(-1)  # [B*T]
+
+        # One-hot encoding [B*T, K]
+        encodings = F.one_hot(indices_flat, num_classes=self.K).float()
+
+        # Update cluster sizes
+        n_i = encodings.sum(dim=0)  # [K]
+        self.ema_cluster_size.mul_(self.ema_decay).add_(n_i, alpha=1 - self.ema_decay)
+
+        # Update embedding averages
+        sum_i = encodings.t() @ z_flat  # [K, D]
+        self.ema_embed_avg.mul_(self.ema_decay).add_(sum_i, alpha=1 - self.ema_decay)
+
+        # Laplace smoothing
+        n = self.ema_cluster_size.sum()
+        cluster_size = (self.ema_cluster_size + 1e-5) / (n + self.K * 1e-5) * n
+
+        # Update codebook
+        self.codebook.copy_(self.ema_embed_avg / cluster_size.unsqueeze(1))
+
+        # Update usage tracker
+        self.codebook_usage.mul_(0.99)
+        self.codebook_usage += n_i
+
+    def _awaken_dead_codes(self, z):
+        """Reinitialize dead codes (not used for N steps)."""
+        if not self.training:
+            return
+
+        dead_mask = self.codebook_usage < 1.0
+        num_dead = dead_mask.sum().item()
+
+        if num_dead > 0:
+            # Sample from recent batch
+            B, T, D = z.shape
+            z_flat = z.reshape(-1, D)
+            random_indices = torch.randperm(z_flat.shape[0], device=z.device)[:num_dead]
+
+            self.codebook[dead_mask] = z_flat[random_indices] + torch.randn(num_dead, D, device=z.device) * 0.01
+            self.codebook_usage[dead_mask] = 1.0
+            self.ema_cluster_size[dead_mask] = 1.0
+            self.ema_embed_avg[dead_mask] = self.codebook[dead_mask]
+
+    def forward(self, z, training=True):
+        """
+        Args:
+            z: [B, T, D] encoder output
+            training: training mode
+
+        Returns:
+            z_q: [B, T, D] quantized output (with dropouts applied)
+            indices: [B, T] discrete indices for LLM
+            commitment_loss: scalar
+            perplexity: scalar (code usage diversity)
+            bypass_applied: bool (for monitoring)
+        """
+        B, T, D = z.shape
+
+        # Compute distances [B, T, K]
+        distances = self._compute_distances(z)
+
+        if training:
+            # Gumbel-Softmax straight-through
+            logits = -distances  # negative distance = similarity
+            codes, indices = self._gumbel_softmax_st(logits, self.gumbel_temp)
+
+            # Quantize: weighted sum of codebook
+            z_q = torch.einsum('btk,kd->btd', codes, self.codebook)
+
+            # Update EMA
+            hard_indices = indices
+            self._update_ema(z, hard_indices)
+
+            # Awaken dead codes every N steps
+            self.step_counter += 1
+            if self.step_counter % self.awakening_steps == 0:
+                self._awaken_dead_codes(z)
+        else:
+            # Inference: argmin distance
+            indices = distances.argmin(dim=-1)  # [B, T]
+            z_q = F.embedding(indices, self.codebook)  # [B, T, D]
+
+        # Commitment loss: encourage encoder to commit to codes
+        commitment_loss = F.mse_loss(z_q.detach(), z)
+
+        # Straight-through: gradient flows through z
+        z_q = z + (z_q - z).detach()
+
+        # ============================================
+        # NEW: A-plan Dropout Trio (training only)
+        # ============================================
+        bypass_applied = False
+
+        if training:
+            # 1. Pre-quant Bypass: use continuous latent directly
+            if torch.rand(1, device=z.device).item() < self.p_bypass:
+                z_bypass = self.bypass_proj(z.transpose(1, 2)).transpose(1, 2)  # [B, T, D]
+                z_q = z_bypass
+                bypass_applied = True
+
+            # 2. Mask Dropout: replace tokens with learnable mask
+            if self.p_mask > 0 and not bypass_applied:
+                mask = torch.rand(B, T, device=z.device) < self.p_mask  # [B, T]
+                z_q = torch.where(mask.unsqueeze(-1), self.mask_token.expand(B, T, D), z_q)
+
+            # 3. Embedding Jitter: add noise to embeddings
+            if self.p_jitter > 0 and not bypass_applied:
+                jitter_mask = torch.rand(B, T, device=z.device) < self.p_jitter  # [B, T]
+                # Compute codebook radius for adaptive jitter
+                codebook_std = self.codebook.std().item()
+                noise = torch.randn_like(z_q) * (self.jitter_sigma * codebook_std)
+                z_q = torch.where(jitter_mask.unsqueeze(-1), z_q + noise, z_q)
+
+        # Perplexity (code diversity)
+        usage_prob = self.codebook_usage / (self.codebook_usage.sum() + 1e-10)
+        entropy = -(usage_prob * torch.log(usage_prob + 1e-10)).sum()
+        perplexity = torch.exp(entropy)
+
+        return {
+            'z_q': z_q,
+            'indices': indices,
+            'commitment_loss': commitment_loss,
+            'perplexity': perplexity,
+            'usage_entropy': entropy,
+            'bypass_applied': bypass_applied,
+        }
+
+
+class ResidualCorrector(nn.Module):
+    """
+    Residual Corrector: Predicts quantization error from indices only.
+
+    Core idea:
+    - Training: r_target = z_continuous - e_q (ground truth from continuous)
+    - Corrector learns: r_hat = f(indices, context)
+    - Inference: z_corrected = e_q + α * r_hat (NO continuous latent needed!)
+
+    This allows quality boost at inference without needing continuous input.
+    """
+    def __init__(self, dim=256, codebook_size=4096, context_size=5):
+        super().__init__()
+        self.dim = dim
+        self.context_size = context_size
+
+        # Optional: index embedding (if helpful for prediction)
+        self.use_index_embed = False  # Start simple
+        if self.use_index_embed:
+            self.index_embed = nn.Embedding(codebook_size, dim)
+
+        # Local context extraction (Conv1d for temporal smoothing)
+        self.context_conv = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=context_size, padding=context_size//2),
+            nn.GroupNorm(8, dim),
+            nn.SiLU(),
+            nn.Conv1d(dim, dim, kernel_size=context_size, padding=context_size//2),
+            nn.GroupNorm(8, dim),
+            nn.SiLU(),
+        )
+
+        # Residual predictor
+        self.predictor = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim * 2, dim),
+        )
+
+        print(f"[ResidualCorrector] Initialized: dim={dim}, context_size={context_size}")
+
+    def forward(self, z_q, indices=None):
+        """
+        Predict residual from quantized embeddings (and optionally indices).
+
+        Args:
+            z_q: [B, T, D] quantized embeddings
+            indices: [B, T] codebook indices (optional, for future use)
+
+        Returns:
+            r_hat: [B, T, D] predicted residual
+        """
+        # Extract local context
+        context = self.context_conv(z_q.transpose(1, 2)).transpose(1, 2)  # [B, T, D]
+
+        # Optional: add index embedding
+        if self.use_index_embed and indices is not None:
+            idx_emb = self.index_embed(indices)  # [B, T, D]
+            context = context + idx_emb
+
+        # Predict residual
+        r_hat = self.predictor(context)  # [B, T, D]
+
+        return r_hat
 
 
 class HybridLatent(nn.Module):

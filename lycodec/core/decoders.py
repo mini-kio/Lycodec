@@ -394,6 +394,7 @@ class TransformerDecoder2D(nn.Module):
         mlp_ratio=4.0,
         dropout=0.0,
         target_size=(1025, 113),
+        max_token_len=24,  # NEW: max token sequence length (changed from 18 to 24)
     ):
         super().__init__()
         self.c_in = c_in
@@ -425,8 +426,8 @@ class TransformerDecoder2D(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
 
         # Learnable positional encoding for tokens
-        # (tokens should already have positional info from encoder, but we can add more)
-        self.token_pos_embed = nn.Parameter(torch.randn(1, 18, embed_dim) * 0.02)
+        # NEW: now supports variable token lengths (24 fps instead of 18)
+        self.token_pos_embed = nn.Parameter(torch.randn(1, max_token_len, embed_dim) * 0.02)
 
         # Transformer decoder blocks
         self.blocks = nn.ModuleList([

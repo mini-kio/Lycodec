@@ -16,7 +16,15 @@ from lycodec.utils.losses import (
     codebook_usage_loss,
     masked_token_prediction_loss,
     acoustic_prediction_loss,
-    semantic_ar_loss
+    semantic_ar_loss,
+    lyric_ctc_loss,
+    section_classification_loss,
+    beat_detection_loss,
+    text_audio_infonce_loss,
+    rvq_perplexity_loss,
+    infill_loss,
+    residual_loss,
+    alignment_loss,
 )
 
 
@@ -62,15 +70,6 @@ def setup_ddp(enable=False):
 
 def is_master():
     return not dist.is_initialized() or dist.get_rank() == 0
-
-
-def set_fsq_dropout(model, p):
-    if hasattr(model, "fsq"):
-        if hasattr(model.fsq, "semantic_fsq"):
-            model.fsq.semantic_fsq.dropout_p = p
-        elif hasattr(model.fsq, "dropout_p"):
-            model.fsq.dropout_p = p
-
 
 
 
@@ -136,10 +135,14 @@ def train(cfg_path, data_root):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    use_partitioned_fsq=cfg["model"].get("use_partitioned_fsq", True),
+                    use_partitioned_fsq=cfg["model"].get("use_partitioned_fsq", False),  # Deprecated
                     semantic_dim=cfg["model"].get("semantic_dim", 120),
                     decoder_depth=cfg["model"].get("decoder_depth", 6),
-                    decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),)
+                    decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),
+                    rvq_codebook_size=cfg["model"].get("rvq_codebook_size", 4096),
+                    token_fps=cfg["model"].get("token_fps", 24),
+                    use_residual_corrector=cfg["model"].get("use_residual_corrector", True),
+                    corrector_alpha=cfg["model"].get("corrector_alpha", 0.3),)
     model.to(device)
     if use_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
@@ -167,38 +170,49 @@ def train(cfg_path, data_root):
         for wav in pbar:
             wav = wav.to(device)  # [B, C, T]
 
-            # FSQ dropout schedule
-            sched = cfg["train"].get("fsq_dropout_schedule", [])
-            for step_thr, p in sched[::-1]:
-                if total_steps >= step_thr:
-                    set_fsq_dropout(model.module if use_ddp else model, p)
-                    break
-
-            # Single-stage training: always train full model with consistency from step 0
-            stage = 2
-            model_obj = model.module if use_ddp else model
-            for param in model_obj.cond.parameters():
-                param.requires_grad = True
-            for param in model_obj.unet.parameters():
-                param.requires_grad = True
-            for param in model_obj.bands.parameters():
-                param.requires_grad = True
-
-            # STFT auxiliary loss weight schedule (only early N steps > 0)
+            # STFT auxiliary loss weight schedule (A-plan: higher weight for quality)
             stft_weight = 0.0
-            stft_sched = cfg["train"].get("recon_weight_schedule", [])
+            stft_sched = cfg["train"].get("stft_weight_schedule", [])
             for step_thr, w in stft_sched[::-1]:
                 if total_steps >= step_thr:
                     stft_weight = float(w)
                     break
 
+            # A-plan: RVQ dropout trio schedules (p_mask, p_jitter, p_bypass)
+            model_obj = model.module if use_ddp else model
+            if hasattr(model_obj, 'rvq'):
+                # Mask dropout schedule: 0.10 → 0.02 (linear decay)
+                mask_sched = cfg["train"].get("rvq_mask_schedule", [])
+                for step_thr, p in mask_sched[::-1]:
+                    if total_steps >= step_thr:
+                        model_obj.rvq.p_mask = p
+                        break
+
+                # Jitter dropout schedule: 0.20 → 0.05 (linear decay)
+                jitter_sched = cfg["train"].get("rvq_jitter_schedule", [])
+                for step_thr, p in jitter_sched[::-1]:
+                    if total_steps >= step_thr:
+                        model_obj.rvq.p_jitter = p
+                        break
+
+                # Bypass dropout schedule: 0.20 → 0.0 (linear decay)
+                bypass_sched = cfg["train"].get("rvq_bypass_schedule", [])
+                for step_thr, p in bypass_sched[::-1]:
+                    if total_steps >= step_thr:
+                        model_obj.rvq.p_bypass = p
+                        break
+
             if scaler is not None:
                 with torch.cuda.amp.autocast():
                     rec, enc = model(wav, decode=True)
+                    model_obj = model.module if use_ddp else model
+
                     # Initialize loss as torch tensor (not float!) to avoid AMP/backward errors
                     loss = torch.zeros((), device=device)
 
-                    # Main consistency loss (single-stage)
+                    # ============================================
+                    # Main consistency loss
+                    # ============================================
                     loss_consistency = consistency_loss(
                         model_obj,
                         wav,
@@ -211,58 +225,70 @@ def train(cfg_path, data_root):
                     )
                     loss = loss + loss_consistency
 
-                    # Optional STFT reconstruction loss with scheduled weight
+                    # ============================================
+                    # A-plan: STFT loss (higher weight: 0.7)
+                    # ============================================
                     if rec is not None and stft_weight > 0:
                         loss_stft = stft_loss(rec, wav, cfg)
                         loss = loss + stft_weight * loss_stft
 
                     # ============================================
-                    # NEW: Semantic Learning Losses (Teacher-Free)
+                    # A-plan: RVQ losses
                     # ============================================
 
-                    # Codebook Regularization
-                    if cfg["train"].get("use_codebook_reg", True):
-                        # Commitment loss (semantic part only for PartitionedFSQ)
-                        if enc["disc"] is not None:
-                            if model_obj.use_partitioned_fsq and "semantic_cont" in enc:
-                                loss_commit = commitment_loss(enc["semantic_cont"], enc["semantic_disc"])
-                            else:
-                                loss_commit = commitment_loss(enc["cont"], enc["disc"])
-                            loss = loss + 0.25 * loss_commit
+                    # RVQ commitment loss (encoder → codebook)
+                    if "commitment_loss" in enc:
+                        loss_commit = enc["commitment_loss"]
+                        loss = loss + 0.25 * loss_commit
 
-                        # Usage loss (prevent collapse)
-                        loss_usage = codebook_usage_loss(model)
-                        loss = loss + 0.01 * loss_usage
+                    # RVQ perplexity loss (encourage codebook usage)
+                    if "perplexity" in enc:
+                        target_ppx = cfg["train"].get("target_perplexity", 2048)  # 0.5 * K
+                        loss_ppx = rvq_perplexity_loss(enc["perplexity"], target_perplexity=target_ppx)
+                        loss = loss + 0.001 * loss_ppx
 
-                    # Semantic-Acoustic losses
-                    if cfg["train"].get("use_semantic_acoustic", True):
-                        # Acoustic prediction loss
-                        loss_acoustic = acoustic_prediction_loss(enc)
-                        loss = loss + 0.3 * loss_acoustic
+                    # ============================================
+                    # A-plan: Infill loss (mask dropout robustness)
+                    # ============================================
+                    if rec is not None and enc.get("bypass_applied", False) is False:
+                        # Only apply when mask/jitter dropout is active (not bypass)
+                        infill_weight = cfg["train"].get("infill_weight", 0.3)
+                        loss_infill = infill_loss(rec, wav, cfg, bypass_applied=enc.get("bypass_applied", False))
+                        loss = loss + infill_weight * loss_infill
 
-                        # Semantic AR loss
-                        loss_semantic_ar = semantic_ar_loss(model, enc)
-                        loss = loss + 0.2 * loss_semantic_ar
+                    # ============================================
+                    # ResidualCorrector losses (if enabled)
+                    # ============================================
+                    if hasattr(model_obj, 'corrector') and model_obj.corrector is not None:
+                        # Residual loss: train corrector to predict quantization error
+                        if "r_target" in enc and "r_hat" in enc and enc["r_target"] is not None:
+                            residual_weight = cfg["train"].get("residual_weight", 1.0)
+                            loss_residual = residual_loss(enc["r_hat"], enc["r_target"])
+                            loss = loss + residual_weight * loss_residual
 
-                    # Masked Token Prediction
-                    if cfg["train"].get("use_masked_prediction", False):
-                        mask_ratio = cfg["train"].get("mask_ratio", 0.10)
-                        loss_masked = masked_token_prediction_loss(
-                            model,
-                            wav,
-                            mask_ratio=mask_ratio
-                        )
-                        mask_weight = cfg["train"].get("mask_weight", 0.05)
-                        loss = loss + mask_weight * loss_masked
+                        # Alignment loss: align continuous and corrected representations
+                        if "z_continuous" in enc and enc["z_continuous"] is not None and "tokens" in enc:
+                            align_weight = cfg["train"].get("alignment_weight", 0.1)
+                            use_cosine = cfg["train"].get("alignment_use_cosine", True)
+                            loss_align = alignment_loss(enc["z_continuous"], enc["tokens"], use_cosine=use_cosine)
+                            loss = loss + align_weight * loss_align
 
-                    # stereo head supervision (ILD)
-                    try:
-                        model_obj = model.module if use_ddp else model
-                        pred_ild = model_obj.stereo(enc["tokens"])['ild']  # [B,T,1]
-                        tgt_ild = tokenwise_ild(wav, enc["tokens"]).to(pred_ild.device)
-                        loss = loss + 0.1 * ((pred_ild - tgt_ild) ** 2).mean()
-                    except Exception:
-                        pass
+                    # ============================================
+                    # Semantic supervision (optional, disabled by default)
+                    # ============================================
+                    # A-plan: Semantic losses applied to RVQ tokens if annotations available
+                    # Set use_semantic_supervision: true in config and provide labeled data
+
+                    # ============================================
+                    # Stereo head supervision (optional)
+                    # ============================================
+                    if cfg["train"].get("use_stereo_loss", False):
+                        try:
+                            pred_ild = model_obj.stereo(enc["tokens"])['ild']  # [B,T,1]
+                            tgt_ild = tokenwise_ild(wav, enc["tokens"]).to(pred_ild.device)
+                            loss = loss + 0.1 * ((pred_ild - tgt_ild) ** 2).mean()
+                        except Exception:
+                            pass
 
                 # Normalize loss by accumulation steps
                 loss = loss / accum_steps
@@ -290,8 +316,12 @@ def train(cfg_path, data_root):
             else:
                 # Non-AMP path (no scaler)
                 rec, enc = model(wav, decode=True)
+                model_obj = model.module if use_ddp else model
                 loss = torch.zeros((), device=device)
+
+                # ============================================
                 # Main consistency loss
+                # ============================================
                 loss_consistency = consistency_loss(
                     model_obj,
                     wav,
@@ -304,48 +334,62 @@ def train(cfg_path, data_root):
                 )
                 loss = loss + loss_consistency
 
-                # Optional STFT reconstruction with scheduled weight
+                # ============================================
+                # A-plan: STFT loss (higher weight: 0.7)
+                # ============================================
                 if rec is not None and stft_weight > 0:
                     loss = loss + stft_weight * stft_loss(rec, wav, cfg)
 
                 # ============================================
-                # NEW: Semantic Learning Losses (Teacher-Free)
+                # A-plan: RVQ losses
                 # ============================================
 
-                # Codebook Regularization
-                if cfg["train"].get("use_codebook_reg", True):
-                    if enc["disc"] is not None:
-                        if model_obj.use_partitioned_fsq and "semantic_cont" in enc:
-                            loss_commit = commitment_loss(enc["semantic_cont"], enc["semantic_disc"])
-                        else:
-                            loss_commit = commitment_loss(enc["cont"], enc["disc"])
-                        loss = loss + 0.25 * loss_commit
-                    loss_usage = codebook_usage_loss(model)
-                    loss = loss + 0.01 * loss_usage
+                # RVQ commitment loss (encoder → codebook)
+                if "commitment_loss" in enc:
+                    loss_commit = enc["commitment_loss"]
+                    loss = loss + 0.25 * loss_commit
 
-                # Semantic-Acoustic losses
-                if cfg["train"].get("use_semantic_acoustic", True):
-                    loss_acoustic = acoustic_prediction_loss(enc)
-                    loss = loss + 0.3 * loss_acoustic
+                # RVQ perplexity loss (encourage codebook usage)
+                if "perplexity" in enc:
+                    target_ppx = cfg["train"].get("target_perplexity", 2048)  # 0.5 * K
+                    loss_ppx = rvq_perplexity_loss(enc["perplexity"], target_perplexity=target_ppx)
+                    loss = loss + 0.001 * loss_ppx
 
-                    loss_semantic_ar = semantic_ar_loss(model, enc)
-                    loss = loss + 0.2 * loss_semantic_ar
+                # ============================================
+                # A-plan: Infill loss (mask dropout robustness)
+                # ============================================
+                if rec is not None and enc.get("bypass_applied", False) is False:
+                    infill_weight = cfg["train"].get("infill_weight", 0.3)
+                    loss_infill = infill_loss(rec, wav, cfg, bypass_applied=enc.get("bypass_applied", False))
+                    loss = loss + infill_weight * loss_infill
 
-                # Masked Token Prediction
-                if cfg["train"].get("use_masked_prediction", False):
-                    mask_ratio = cfg["train"].get("mask_ratio", 0.10)
-                    loss_masked = masked_token_prediction_loss(model, wav, mask_ratio=mask_ratio)
-                    mask_weight = cfg["train"].get("mask_weight", 0.05)
-                    loss = loss + mask_weight * loss_masked
+                # ============================================
+                # ResidualCorrector losses (if enabled)
+                # ============================================
+                if hasattr(model_obj, 'corrector') and model_obj.corrector is not None:
+                    # Residual loss: train corrector to predict quantization error
+                    if "r_target" in enc and "r_hat" in enc and enc["r_target"] is not None:
+                        residual_weight = cfg["train"].get("residual_weight", 1.0)
+                        loss_residual = residual_loss(enc["r_hat"], enc["r_target"])
+                        loss = loss + residual_weight * loss_residual
 
-                # stereo head supervision (ILD)
-                try:
-                    model_obj = model.module if use_ddp else model
-                    pred_ild = model_obj.stereo(enc["tokens"])['ild']  # [B,T,1]
-                    tgt_ild = tokenwise_ild(wav, enc["tokens"]).to(pred_ild.device)
-                    loss = loss + 0.1 * ((pred_ild - tgt_ild) ** 2).mean()
-                except Exception:
-                    pass
+                    # Alignment loss: align continuous and corrected representations
+                    if "z_continuous" in enc and enc["z_continuous"] is not None and "tokens" in enc:
+                        align_weight = cfg["train"].get("alignment_weight", 0.1)
+                        use_cosine = cfg["train"].get("alignment_use_cosine", True)
+                        loss_align = alignment_loss(enc["z_continuous"], enc["tokens"], use_cosine=use_cosine)
+                        loss = loss + align_weight * loss_align
+
+                # ============================================
+                # Stereo head supervision (optional)
+                # ============================================
+                if cfg["train"].get("use_stereo_loss", False):
+                    try:
+                        pred_ild = model_obj.stereo(enc["tokens"])['ild']  # [B,T,1]
+                        tgt_ild = tokenwise_ild(wav, enc["tokens"]).to(pred_ild.device)
+                        loss = loss + 0.1 * ((pred_ild - tgt_ild) ** 2).mean()
+                    except Exception:
+                        pass
 
                 # Normalize loss by accumulation steps
                 loss = loss / accum_steps
@@ -405,10 +449,12 @@ def load_model(ckpt_path, cfg_path):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    use_partitioned_fsq=cfg["model"].get("use_partitioned_fsq", True),
+                    use_partitioned_fsq=cfg["model"].get("use_partitioned_fsq", False),  # Deprecated
                     semantic_dim=cfg["model"].get("semantic_dim", 120),
                     decoder_depth=cfg["model"].get("decoder_depth", 6),
-                    decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),)
+                    decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),
+                    rvq_codebook_size=cfg["model"].get("rvq_codebook_size", 4096),
+                    token_fps=cfg["model"].get("token_fps", 24),)
     if ckpt_path and os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu")["model"]
         from collections import OrderedDict

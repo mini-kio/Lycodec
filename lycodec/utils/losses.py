@@ -293,3 +293,273 @@ def masked_token_prediction_loss(model, wav, mask_ratio=0.15):
         loss = loss + F.mse_loss(masked_pred, masked_target)
 
     return loss / B
+
+
+# ============================================
+# NEW: Semantic Supervision Losses
+# Applied ONLY to coarse RVQ path (not fine FSQ)
+# ============================================
+
+def lyric_ctc_loss(coarse_tokens, lyric_labels, lyric_lengths, token_lengths):
+    """
+    CTC loss for lyrics alignment to coarse tokens.
+
+    Args:
+        coarse_tokens: [B, T, D] RVQ coarse tokens
+        lyric_labels: [B, L] phoneme/character indices
+        lyric_lengths: [B] lengths of lyric sequences
+        token_lengths: [B] lengths of token sequences
+
+    Returns:
+        CTC loss
+
+    Note: Requires lyric annotations. If not available, returns 0.
+    """
+    if lyric_labels is None:
+        return torch.tensor(0.0, device=coarse_tokens.device)
+
+    B, T, D = coarse_tokens.shape
+    device = coarse_tokens.device
+
+    # Create lyric predictor head if not exists
+    # This is a placeholder - actual implementation needs vocab size
+    vocab_size = 256  # Example: 256 phonemes/chars
+
+    # Linear projection to vocab
+    lyric_head = nn.Linear(D, vocab_size).to(device)
+
+    # Get logits [B, T, vocab_size]
+    logits = lyric_head(coarse_tokens)
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # CTC expects [T, B, vocab_size]
+    log_probs = log_probs.transpose(0, 1)
+
+    # CTC loss
+    ctc_loss = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True)
+    loss = ctc_loss(log_probs, lyric_labels, token_lengths, lyric_lengths)
+
+    return loss
+
+
+def section_classification_loss(coarse_tokens, section_labels):
+    """
+    Section classification loss (verse/chorus/bridge/intro/outro).
+
+    Args:
+        coarse_tokens: [B, T, D] RVQ coarse tokens
+        section_labels: [B, T] section class indices
+
+    Returns:
+        Cross-entropy loss
+
+    Note: Requires section annotations. If not available, returns 0.
+    """
+    if section_labels is None:
+        return torch.tensor(0.0, device=coarse_tokens.device)
+
+    B, T, D = coarse_tokens.shape
+    device = coarse_tokens.device
+
+    # Section classes: 0=intro, 1=verse, 2=chorus, 3=bridge, 4=outro, 5=other
+    num_classes = 6
+
+    # Create section classifier head if not exists
+    section_head = nn.Linear(D, num_classes).to(device)
+
+    # Get logits [B, T, num_classes]
+    logits = section_head(coarse_tokens)
+
+    # Cross-entropy loss
+    loss = F.cross_entropy(logits.reshape(-1, num_classes), section_labels.reshape(-1))
+
+    return loss
+
+
+def beat_detection_loss(coarse_tokens, beat_labels):
+    """
+    Beat detection loss (binary: beat/no-beat per token).
+
+    Args:
+        coarse_tokens: [B, T, D] RVQ coarse tokens
+        beat_labels: [B, T] binary labels (1=beat, 0=no-beat)
+
+    Returns:
+        Binary cross-entropy loss
+
+    Note: Requires beat annotations. If not available, returns 0.
+    """
+    if beat_labels is None:
+        return torch.tensor(0.0, device=coarse_tokens.device)
+
+    B, T, D = coarse_tokens.shape
+    device = coarse_tokens.device
+
+    # Create beat detector head if not exists
+    beat_head = nn.Sequential(
+        nn.Linear(D, 128),
+        nn.GELU(),
+        nn.Linear(128, 1),
+    ).to(device)
+
+    # Get predictions [B, T, 1]
+    logits = beat_head(coarse_tokens).squeeze(-1)  # [B, T]
+
+    # BCE loss
+    loss = F.binary_cross_entropy_with_logits(logits, beat_labels.float())
+
+    return loss
+
+
+def text_audio_infonce_loss(coarse_tokens, text_embeddings, temperature=0.07):
+    """
+    InfoNCE contrastive loss between text prompts and coarse audio tokens.
+
+    Args:
+        coarse_tokens: [B, T, D] RVQ coarse tokens
+        text_embeddings: [B, D_text] text prompt embeddings (e.g., from CLIP/T5)
+        temperature: softmax temperature
+
+    Returns:
+        InfoNCE loss
+
+    Note: Requires text descriptions. If not available, returns 0.
+    """
+    if text_embeddings is None:
+        return torch.tensor(0.0, device=coarse_tokens.device)
+
+    B, T, D = coarse_tokens.shape
+    device = coarse_tokens.device
+
+    # Pool coarse tokens to [B, D]
+    audio_embeddings = coarse_tokens.mean(dim=1)  # [B, D]
+
+    # Project to common space if dimensions don't match
+    if audio_embeddings.shape[-1] != text_embeddings.shape[-1]:
+        proj_dim = 512
+        audio_proj = nn.Linear(D, proj_dim).to(device)
+        text_proj = nn.Linear(text_embeddings.shape[-1], proj_dim).to(device)
+        audio_embeddings = audio_proj(audio_embeddings)
+        text_embeddings = text_proj(text_embeddings)
+
+    # Normalize
+    audio_embeddings = F.normalize(audio_embeddings, dim=-1)
+    text_embeddings = F.normalize(text_embeddings, dim=-1)
+
+    # Compute similarity matrix [B, B]
+    logits = torch.matmul(audio_embeddings, text_embeddings.t()) / temperature
+
+    # Labels: diagonal (positive pairs)
+    labels = torch.arange(B, device=device)
+
+    # InfoNCE: symmetric loss (audio→text and text→audio)
+    loss_a2t = F.cross_entropy(logits, labels)
+    loss_t2a = F.cross_entropy(logits.t(), labels)
+
+    loss = (loss_a2t + loss_t2a) / 2
+
+    return loss
+
+
+def rvq_perplexity_loss(perplexity, target_perplexity=2048):
+    """
+    Encourage RVQ codebook usage to reach target perplexity.
+
+    Args:
+        perplexity: current perplexity (exp of entropy)
+        target_perplexity: desired perplexity (e.g., 0.5 * K = 2048 for K=4096)
+
+    Returns:
+        Penalty if perplexity is below target
+    """
+    if perplexity >= target_perplexity:
+        return torch.tensor(0.0, device=perplexity.device)
+
+    gap = target_perplexity - perplexity
+    loss = (gap / target_perplexity) ** 2
+
+    return loss
+
+
+# ============================================
+# NEW: A-plan Infill Loss
+# ============================================
+
+def infill_loss(rec_wav, target_wav, cfg, bypass_applied=False):
+    """
+    Infill loss for mask dropout robustness.
+
+    Ensures decoder can reconstruct even when tokens are masked.
+    Uses STFT loss to measure reconstruction quality.
+
+    Args:
+        rec_wav: reconstructed waveform [B, C, T]
+        target_wav: target waveform [B, C, T]
+        cfg: config dict with STFT parameters
+        bypass_applied: if True, skip (bypass already uses continuous)
+
+    Returns:
+        STFT loss between rec and target
+    """
+    if bypass_applied:
+        # Bypass path already uses continuous latent, no need for infill
+        return torch.tensor(0.0, device=rec_wav.device)
+
+    # Use existing STFT loss
+    return stft_loss(rec_wav, target_wav, cfg)
+
+
+# ============================================
+# ResidualCorrector Losses
+# ============================================
+
+def residual_loss(r_hat, r_target):
+    """
+    Residual prediction loss: train corrector to predict quantization error.
+
+    L_residual = ||r_hat - r_target||^2
+
+    Where:
+    - r_target = z_continuous - z_q (ground truth quantization error)
+    - r_hat = corrector(z_q, indices) (predicted residual from indices only)
+
+    Args:
+        r_hat: predicted residual [B, T, D]
+        r_target: target residual (z_continuous - z_q) [B, T, D]
+
+    Returns:
+        MSE loss between predicted and target residuals
+    """
+    if r_hat is None or r_target is None:
+        return torch.tensor(0.0, device=r_hat.device if r_hat is not None else r_target.device)
+
+    return F.mse_loss(r_hat, r_target)
+
+
+def alignment_loss(z_continuous, z_corrected, use_cosine=True):
+    """
+    Alignment loss: align continuous and corrected discrete representations.
+
+    Ensures corrected tokens (z_q + α*r_hat) are close to continuous latent.
+
+    L_align = ||z_continuous - z_corrected||^2  (MSE)
+           or 1 - cosine(z_continuous, z_corrected)  (cosine)
+
+    Args:
+        z_continuous: continuous encoder output [B, T, D]
+        z_corrected: corrected quantized tokens z_q + α*r_hat [B, T, D]
+        use_cosine: if True, use cosine similarity; else MSE
+
+    Returns:
+        Alignment loss between continuous and corrected representations
+    """
+    if z_continuous is None or z_corrected is None:
+        device = z_continuous.device if z_continuous is not None else z_corrected.device
+        return torch.tensor(0.0, device=device)
+
+    if use_cosine:
+        # Cosine alignment: 1 - cosine_similarity
+        return cosine_align(z_continuous, z_corrected)
+    else:
+        # L2 alignment
+        return F.mse_loss(z_corrected, z_continuous)
