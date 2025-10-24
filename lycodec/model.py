@@ -5,9 +5,6 @@ from lycodec.core.blocks import (
     Patchifier,
     TransformerEncoder,
     TemporalResampler,
-    FSQQuantizer,
-    GroupFSQ,
-    PartitionedFSQ,
     RVQQuantizer,
     ResidualCorrector,
     HybridLatent,
@@ -17,7 +14,7 @@ from lycodec.core.decoders import TokenConditioner, TransformerDecoder2D, BandSp
 
 
 class Lycodec(nn.Module):
-    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False, use_rope=True, use_partitioned_fsq=True, semantic_dim=120, decoder_depth=6, decoder_patch_size=16, rvq_codebook_size=4096, token_fps=24, use_residual_corrector=True, corrector_alpha=0.3):
+    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False, use_rope=True, semantic_dim=120, decoder_depth=6, decoder_patch_size=16, rvq_codebook_size=4096, token_fps=24, use_residual_corrector=True, corrector_alpha=0.3):
         super().__init__()
         self.sr = sr
         self.n_fft = n_fft
@@ -25,7 +22,6 @@ class Lycodec(nn.Module):
         self.win = win
         self.token_dim = token_dim
         self.token_fps = token_fps
-        self.use_partitioned_fsq = use_partitioned_fsq
         self.use_residual_corrector = use_residual_corrector
         self.corrector_alpha = corrector_alpha
 

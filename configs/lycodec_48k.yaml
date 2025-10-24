@@ -21,7 +21,6 @@ model:
   # A-PLAN: Single RVQ only (FSQ removed)
   token_fps: 24                # 24 fps = 24 tokens/second
   rvq_codebook_size: 4096      # K=4096 for single RVQ
-  use_partitioned_fsq: false   # DEPRECATED (removed)
   semantic_dim: 120            # Kept for backward compatibility
   decoder_depth: 8             # Increased from 6 to 8 for quality
   decoder_patch_size: 16

@@ -13,10 +13,8 @@ from lycodec.utils.losses import (
     stft_loss,
     consistency_loss,
     commitment_loss,
-    codebook_usage_loss,
     masked_token_prediction_loss,
     acoustic_prediction_loss,
-    semantic_ar_loss,
     lyric_ctc_loss,
     section_classification_loss,
     beat_detection_loss,
@@ -135,7 +133,6 @@ def train(cfg_path, data_root):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    use_partitioned_fsq=cfg["model"].get("use_partitioned_fsq", False),  # Deprecated
                     semantic_dim=cfg["model"].get("semantic_dim", 120),
                     decoder_depth=cfg["model"].get("decoder_depth", 6),
                     decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),
@@ -449,12 +446,13 @@ def load_model(ckpt_path, cfg_path):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    use_partitioned_fsq=cfg["model"].get("use_partitioned_fsq", False),  # Deprecated
                     semantic_dim=cfg["model"].get("semantic_dim", 120),
                     decoder_depth=cfg["model"].get("decoder_depth", 6),
                     decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),
                     rvq_codebook_size=cfg["model"].get("rvq_codebook_size", 4096),
-                    token_fps=cfg["model"].get("token_fps", 24),)
+                    token_fps=cfg["model"].get("token_fps", 24),
+                    use_residual_corrector=cfg["model"].get("use_residual_corrector", True),
+                    corrector_alpha=cfg["model"].get("corrector_alpha", 0.3),)
     if ckpt_path and os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu")["model"]
         from collections import OrderedDict
