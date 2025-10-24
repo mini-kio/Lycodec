@@ -18,80 +18,36 @@ model:
   transformer_layers: 8
   heads: 8
   use_rope: true
-  # A-PLAN: Single RVQ only (FSQ removed)
-  token_fps: 24                # 24 fps = 24 tokens/second
-  rvq_codebook_size: 4096      # K=4096 for single RVQ
-  semantic_dim: 120            # Kept for backward compatibility
-  decoder_depth: 8             # Increased from 6 to 8 for quality
+  token_fps: 24
+  rvq_codebook_size: 4096
+  decoder_depth: 8
   decoder_patch_size: 16
-  # ResidualCorrector: predict quantization error from indices
-  use_residual_corrector: true # Enable corrector (default: true)
-  corrector_alpha: 0.3         # Correction strength: z_corrected = z_q + α*r_hat
+  use_residual_corrector: true
+  corrector_alpha: 0.3
+  rvq_drop_start: 0.6
+  rvq_drop_end: 0.1
+  rvq_drop_decay_steps: 100000
+
 train:
-  # Single-stage training: consistency from step 0
   stage: 2
   stage1_steps: 0
-  stage2_steps: 100000  # Extended for A-plan
+  stage2_steps: 100000
   grad_clip: 1.0
   use_amp: true
   gradient_accumulation_steps: 1
 
-  # ============================================
-  # A-PLAN: RVQ Dropout Trio Schedules
-  # ============================================
+  stft_weight_schedule:
+    - [0, 0.7]
+    - [100000, 0.7]
 
-  # Mask dropout: 0.10 → 0.02 (linear decay over 100k steps)
-  rvq_mask_schedule:
-    - [0, 0.10]       # 10% initially
-    - [25000, 0.07]
-    - [50000, 0.04]
-    - [75000, 0.02]
-    - [100000, 0.02]  # Final 2%
-
-  # Jitter dropout: 0.20 → 0.05 (linear decay)
-  rvq_jitter_schedule:
-    - [0, 0.20]       # 20% initially
-    - [25000, 0.15]
-    - [50000, 0.10]
-    - [75000, 0.07]
-    - [100000, 0.05]  # Final 5%
-
-  # Bypass dropout: 0.20 → 0.0 (linear decay, disabled at end)
-  rvq_bypass_schedule:
-    - [0, 0.20]       # 20% initially (stabilize decoder with continuous)
-    - [25000, 0.15]
-    - [50000, 0.10]
-    - [75000, 0.05]
-    - [100000, 0.00]  # Final 0% (pure RVQ)
-
-  # RVQ perplexity target (0.5 * K = 2048 for K=4096)
+  infill_weight: 0.3
+  residual_weight: 1.0
+  alignment_weight: 0.1
+  contrast_weight: 1.0
   target_perplexity: 2048
-
-  # Noise schedule for consistency model
   sigma_min: 0.002
   sigma_max: 80.0
   rho: 7.0
-
-  # ============================================
-  # A-PLAN: Loss Weights
-  # ============================================
-
-  # STFT loss: higher weight (0.7) for quality
-  stft_weight_schedule:
-    - [0, 0.7]        # 0.7 throughout (increased from 0.5)
-    - [100000, 0.7]
-
-  # Infill loss: mask dropout robustness
-  infill_weight: 0.3  # Weight for infill loss (λ_m)
-
-  # ResidualCorrector loss weights
-  residual_weight: 1.0         # Weight for residual loss: ||r_hat - r_target||^2
-  alignment_weight: 0.1        # Weight for alignment loss: align z_continuous and z_corrected
-  alignment_use_cosine: true   # Use cosine similarity (true) or MSE (false)
-
-  # ============================================
-  # Training Infrastructure
-  # ============================================
 
   ddp: false
   use_checkpoint: true
@@ -99,9 +55,6 @@ train:
     enabled: true
     decay: 0.9999
 
-  # Semantic supervision (requires annotated data)
-  use_semantic_supervision: false  # Set to true when annotations available
-  use_stereo_loss: false           # Optional stereo ILD loss
 data:
   wav_exts: [".wav", ".flac", ".mp3"]
   segment_seconds: 1.5

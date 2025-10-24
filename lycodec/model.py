@@ -7,13 +7,24 @@ from lycodec.core.blocks import (
     TemporalResampler,
     RVQQuantizer,
     ResidualCorrector,
-    StereoHead,
 )
 from lycodec.core.decoders import TokenConditioner, TransformerDecoder2D, BandSplitHead, edm_parameterization
 
 
 class Lycodec(nn.Module):
-    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048, token_dim=256, hidden=512, layers=8, heads=8, use_checkpoint=False, use_rope=True, semantic_dim=120, decoder_depth=6, decoder_patch_size=16, rvq_codebook_size=4096, token_fps=24, use_residual_corrector=True, corrector_alpha=0.3):
+    def _summary_head(self, sequence):
+        if sequence is None:
+            return None
+        pooled = sequence.mean(dim=1)
+        return nn.functional.normalize(pooled, dim=-1)
+
+    def __init__(self, sr=48000, n_fft=2048, hop=640, win=2048,
+                 token_dim=256, hidden=512, layers=8, heads=8,
+                 use_checkpoint=False, use_rope=True,
+                 decoder_depth=6, decoder_patch_size=16,
+                 rvq_codebook_size=4096, token_fps=24,
+                 rvq_drop_start=0.6, rvq_drop_end=0.1, rvq_drop_decay_steps=200000,
+                 use_residual_corrector=True, corrector_alpha=0.3):
         super().__init__()
         self.sr = sr
         self.n_fft = n_fft
@@ -22,34 +33,36 @@ class Lycodec(nn.Module):
         self.token_dim = token_dim
         self.token_fps = token_fps
         self.use_residual_corrector = use_residual_corrector
-        self.corrector_alpha = corrector_alpha
+        self.corrector_alpha = float(max(0.0, min(corrector_alpha, 0.3)))
 
         self.patch = Patchifier(c_in=4, widths=(64, 128, 256, 512))
         self.enc_proj = nn.Conv2d(512, hidden, 1)
-        self.resampler = TemporalResampler(hidden, t_out=token_fps)  # 24 fps
-        self.encoder = TransformerEncoder(dim=hidden, depth=layers, heads=heads, use_checkpoint=use_checkpoint, use_rope=use_rope, seq_len=token_fps)
+        self.resampler = TemporalResampler(hidden, t_out=token_fps)
+        self.encoder = TransformerEncoder(
+            dim=hidden,
+            depth=layers,
+            heads=heads,
+            use_checkpoint=use_checkpoint,
+            use_rope=use_rope,
+            seq_len=token_fps,
+        )
         self.to_token = nn.Linear(hidden, token_dim)
+        self.shared_proj = nn.Linear(token_dim, token_dim)
 
-        # NEW: Single RVQ (A-plan: FSQ removed, dropouts handle robustness)
-        print(f"[Lycodec] A-PLAN: Single RVQ only (K={rvq_codebook_size}, {token_fps} fps)")
-        print(f"[Lycodec] FSQ removed - decoder reinforced + dropout trio for quality")
         self.rvq = RVQQuantizer(
             dim=token_dim,
             codebook_size=rvq_codebook_size,
             ema_decay=0.99,
             awakening_steps=2000,
             gumbel_temp=1.0,
-            p_mask=0.10,    # Will be scheduled
-            p_jitter=0.20,  # Will be scheduled
-            p_bypass=0.20,  # Will be scheduled
-            jitter_sigma=0.07,
+            drop_start=rvq_drop_start,
+            drop_end=rvq_drop_end,
+            drop_decay_steps=rvq_drop_decay_steps,
         )
+        print(f"[Lycodec] RVQ dropout {rvq_drop_start}->{rvq_drop_end} (steps={rvq_drop_decay_steps})")
 
-        # ResidualCorrector: Predict quantization error from indices only
         if use_residual_corrector:
-            print(f"[Lycodec] ResidualCorrector enabled (alpha={corrector_alpha})")
-            print(f"[Lycodec]   - Training: r_target = z_continuous - z_q")
-            print(f"[Lycodec]   - Inference: z_corrected = z_q + α*r_hat (indices only)")
+            print("[Lycodec] ResidualCorrector enabled (alpha≤0.3)")
             self.corrector = ResidualCorrector(
                 dim=token_dim,
                 codebook_size=rvq_codebook_size,
@@ -58,14 +71,10 @@ class Lycodec(nn.Module):
         else:
             self.corrector = None
 
-        self.stereo = StereoHead(dim=token_dim)
-
         self.cond = TokenConditioner(token_dim=token_dim, cond_ch=64, t_out=113, f_bins=self.n_fft // 2 + 1)
-
-        # Transformer decoder
-        print(f"[Lycodec] Using TransformerDecoder2D (depth={decoder_depth}, patch_size={decoder_patch_size})")
+        print(f"[Lycodec] TransformerDecoder2D depth={decoder_depth}, patch={decoder_patch_size}")
         self.decoder = TransformerDecoder2D(
-            c_in=68,  # 4 (spec) + 64 (cond)
+            c_in=68,
             c_out=4,
             embed_dim=512,
             depth=decoder_depth,
@@ -75,24 +84,13 @@ class Lycodec(nn.Module):
             mlp_ratio=4.0,
             dropout=0.0,
             target_size=(self.n_fft // 2 + 1, 113),
-            max_token_len=token_fps,  # NEW: pass token sequence length
+            max_token_len=token_fps,
         )
-
         self.bands = BandSplitHead(c_in=4, sr=sr, n_fft=n_fft)
 
+
     def encode(self, wav):
-        """
-        A-PLAN: Single RVQ encoding (FSQ removed)
-
-        RVQ dropout trio handles robustness:
-        - Mask dropout: corruption resistance
-        - Jitter: quantization boundary smoothing
-        - Bypass: decoder learns from continuous latents
-
-        ResidualCorrector (if enabled):
-        - Training: learns r_target = z_continuous - z_q from indices
-        - Inference: predicts r_hat from indices only, z_corrected = z_q + α*r_hat
-        """
+        """Encode waveform and expose discrete/continuous shared representations."""
         spec = wav_to_spec(wav, self.n_fft, self.hop, self.win)
         z, _ = self.patch(spec)
         z = self.enc_proj(z)
@@ -100,43 +98,51 @@ class Lycodec(nn.Module):
         z = self.resampler(z)
         z = z.transpose(1, 2)
         z = self.encoder(z)
-        z_continuous = self.to_token(z)  # [B, T, D] - continuous latent
+        z_continuous = self.to_token(z)
 
-        # Single RVQ with dropout trio
+        y_cont = self.shared_proj(z_continuous)
+        y_cont_detached = self.shared_proj(z_continuous.detach())
+
         rvq_out = self.rvq(z_continuous, training=self.training)
-        z_q = rvq_out['z_q']  # Quantized embeddings [B, T, D]
+        y_disc = self.shared_proj(rvq_out['embedding'])
+        y_disc_corrected = y_disc
 
-        # ResidualCorrector: predict quantization error from indices only
-        tokens_final = z_q
-        r_target = None
         r_hat = None
-
+        r_target = None
         if self.corrector is not None:
+            r_hat = self.corrector(rvq_out['indices'])
+            if r_hat is not None:
+                y_disc_corrected = y_disc + self.corrector_alpha * r_hat
             if self.training:
-                # Training: compute target residual r_target = z_continuous - z_q
-                # Train corrector to predict this from indices only
-                r_target = z_continuous - z_q.detach()  # Detach to not affect RVQ
-                r_hat = self.corrector(z_q.detach(), rvq_out['indices'])
-                # Apply correction with clamped alpha
-                alpha = torch.clamp(torch.tensor(self.corrector_alpha), 0.0, 1.0)
-                tokens_final = z_q + alpha * r_hat
-            else:
-                # Inference: predict residual from quantized embeddings only (no continuous)
-                r_hat = self.corrector(z_q, rvq_out['indices'])
-                alpha = torch.clamp(torch.tensor(self.corrector_alpha), 0.0, 1.0)
-                tokens_final = z_q + alpha * r_hat
+                r_target = y_cont_detached - y_disc.detach()
+
+        drop_prob = float(rvq_out['drop_prob']) if self.training else 0.0
+        dropout_applied = False
+        tokens_for_decoder = y_disc_corrected
+        if self.training and drop_prob > 0.0:
+            if torch.rand(1, device=tokens_for_decoder.device).item() < drop_prob:
+                tokens_for_decoder = y_cont
+                dropout_applied = True
+
+        summary_disc = self._summary_head(y_disc)
+        summary_cont = self._summary_head(y_cont_detached if self.training else y_cont)
 
         return {
-            "tokens": tokens_final,  # Corrected tokens for decoder
-            "indices": rvq_out['indices'],  # LLM prediction target [B, T] ∈ [0, K-1]
+            "tokens": tokens_for_decoder,
+            "indices": rvq_out['indices'],
             "commitment_loss": rvq_out['commitment_loss'],
             "perplexity": rvq_out['perplexity'],
             "usage_entropy": rvq_out['usage_entropy'],
-            "bypass_applied": rvq_out['bypass_applied'],  # Monitoring
-            "r_target": r_target,  # Target residual (training only)
-            "r_hat": r_hat,  # Predicted residual
-            "z_q_uncorrected": z_q,  # Uncorrected quantized tokens (for analysis)
-            "z_continuous": z_continuous if self.training else None,  # Continuous latent (training only)
+            "dropout_applied": dropout_applied,
+            "drop_prob": drop_prob,
+            "y_disc": y_disc,
+            "y_disc_corrected": y_disc_corrected,
+            "alignment_target": y_cont_detached if self.training else None,
+            "r_target": r_target,
+            "r_hat": r_hat,
+            "z_continuous": z_continuous if self.training else None,
+            "summary_disc": summary_disc,
+            "summary_cont": summary_cont,
         }
 
     def decode(self, tokens, length, sigma=None, spec_init=None):

@@ -34,10 +34,6 @@ def stft_loss(x, y, cfg):
         losses.append((torch.angle(X) - torch.angle(Y)).abs().mean())
     return sum(losses)
 
-def cosine_align(a, b):
-    a = F.normalize(a, dim=-1)
-    b = F.normalize(b, dim=-1)
-    return 1 - (a * b).sum(dim=-1).mean()
 
 def sample_noise_levels(batch_size, device, sigma_min=0.002, sigma_max=80.0, rho=7.0):
     """
@@ -166,83 +162,38 @@ def rvq_perplexity_loss(perplexity, target_perplexity=2048):
 
     return loss
 
-# ============================================
-# NEW: A-plan Infill Loss
-# ============================================
-
-def infill_loss(rec_wav, target_wav, cfg, bypass_applied=False):
-    """
-    Infill loss for mask dropout robustness.
-
-    Ensures decoder can reconstruct even when tokens are masked.
-    Uses STFT loss to measure reconstruction quality.
-
-    Args:
-        rec_wav: reconstructed waveform [B, C, T]
-        target_wav: target waveform [B, C, T]
-        cfg: config dict with STFT parameters
-        bypass_applied: if True, skip (bypass already uses continuous)
-
-    Returns:
-        STFT loss between rec and target
-    """
-    if bypass_applied:
-        # Bypass path already uses continuous latent, no need for infill
-        return torch.tensor(0.0, device=rec_wav.device)
-
-    # Use existing STFT loss
+def infill_loss(rec_wav, target_wav, cfg, decoder_used_continuous=False):
+    """STFT infill loss; skipped when decoder already saw continuous latents."""
+    if decoder_used_continuous:
+        return torch.zeros((), device=rec_wav.device)
     return stft_loss(rec_wav, target_wav, cfg)
 
-# ============================================
-# ResidualCorrector Losses
-# ============================================
-
 def residual_loss(r_hat, r_target):
-    """
-    Residual prediction loss: train corrector to predict quantization error.
-
-    L_residual = ||r_hat - r_target||^2
-
-    Where:
-    - r_target = z_continuous - z_q (ground truth quantization error)
-    - r_hat = corrector(z_q, indices) (predicted residual from indices only)
-
-    Args:
-        r_hat: predicted residual [B, T, D]
-        r_target: target residual (z_continuous - z_q) [B, T, D]
-
-    Returns:
-        MSE loss between predicted and target residuals
-    """
-    if r_hat is None or r_target is None:
-        return torch.tensor(0.0, device=r_hat.device if r_hat is not None else r_target.device)
-
+    """MSE between predicted residuals and detached targets."""
+    if not isinstance(r_hat, torch.Tensor) or not isinstance(r_target, torch.Tensor):
+        device = r_hat.device if isinstance(r_hat, torch.Tensor) else (
+            r_target.device if isinstance(r_target, torch.Tensor) else 'cpu')
+        return torch.zeros((), device=device)
     return F.mse_loss(r_hat, r_target)
 
-def alignment_loss(z_continuous, z_corrected, use_cosine=True):
-    """
-    Alignment loss: align continuous and corrected discrete representations.
+def alignment_loss(y_disc, y_cont_detached):
+    """Cosine alignment that pins discrete path to detached continuous target."""
+    if not isinstance(y_disc, torch.Tensor) or not isinstance(y_cont_detached, torch.Tensor):
+        device = y_disc.device if isinstance(y_disc, torch.Tensor) else (
+            y_cont_detached.device if isinstance(y_cont_detached, torch.Tensor) else 'cpu')
+        return torch.zeros((), device=device)
+    y_disc_norm = F.normalize(y_disc, dim=-1)
+    y_cont_norm = F.normalize(y_cont_detached, dim=-1)
+    return 1 - (y_disc_norm * y_cont_norm).sum(dim=-1).mean()
 
-    Ensures corrected tokens (z_q + α*r_hat) are close to continuous latent.
-
-    L_align = ||z_continuous - z_corrected||^2  (MSE)
-           or 1 - cosine(z_continuous, z_corrected)  (cosine)
-
-    Args:
-        z_continuous: continuous encoder output [B, T, D]
-        z_corrected: corrected quantized tokens z_q + α*r_hat [B, T, D]
-        use_cosine: if True, use cosine similarity; else MSE
-
-    Returns:
-        Alignment loss between continuous and corrected representations
-    """
-    if z_continuous is None or z_corrected is None:
-        device = z_continuous.device if z_continuous is not None else z_corrected.device
-        return torch.tensor(0.0, device=device)
-
-    if use_cosine:
-        # Cosine alignment: 1 - cosine_similarity
-        return cosine_align(z_continuous, z_corrected)
-    else:
-        # L2 alignment
-        return F.mse_loss(z_corrected, z_continuous)
+def summary_contrast_loss(summary_a, summary_b, temperature=0.07):
+    """InfoNCE between two batches of summary vectors."""
+    if summary_a is None or summary_b is None:
+        return torch.zeros((), device=summary_a.device if summary_a is not None else summary_b.device)
+    summary_a = F.normalize(summary_a, dim=-1)
+    summary_b = F.normalize(summary_b, dim=-1)
+    logits = summary_a @ summary_b.t() / temperature
+    labels = torch.arange(summary_a.size(0), device=summary_a.device)
+    loss_ab = F.cross_entropy(logits, labels)
+    loss_ba = F.cross_entropy(logits.t(), labels)
+    return 0.5 * (loss_ab + loss_ba)

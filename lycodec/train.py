@@ -1,5 +1,4 @@
 import os
-import math
 import yaml
 from tqdm import tqdm
 import torch
@@ -12,11 +11,11 @@ from lycodec.model import Lycodec
 from lycodec.utils.losses import (
     stft_loss,
     consistency_loss,
-    commitment_loss,
     rvq_perplexity_loss,
     infill_loss,
     residual_loss,
     alignment_loss,
+    summary_contrast_loss,
 )
 
 
@@ -65,47 +64,6 @@ def is_master():
 
 
 
-def tokenwise_ild(wav, tokens):
-    # wav: [B,2,T], tokens: [B,Tk,D] → per-token ILD [B,Tk,1]
-    import torch
-    b, _, t = wav.shape
-    tk = tokens.shape[1]
-    seg = t // tk
-    vals = []
-    for i in range(tk):
-        s = i * seg
-        e = t if i == tk - 1 else (i + 1) * seg
-        w = wav[:, :, s:e]
-        l = (w[:, 0] ** 2).mean(dim=-1).sqrt().clamp_min(1e-8)
-        r = (w[:, 1] ** 2).mean(dim=-1).sqrt().clamp_min(1e-8)
-        ild = 20.0 * torch.log10((l + 1e-8) / (r + 1e-8))
-        vals.append(ild.view(b, 1))
-    return torch.stack(vals, dim=1)  # [B,Tk,1]
-
-
-def stereo_metrics_inline(gt, pred):
-    import torch
-    with torch.no_grad():
-        def ild(x):
-            l, r = x[:, 0], x[:, 1]
-            el = (l ** 2).mean(dim=-1).clamp_min(1e-8).sqrt()
-            er = (r ** 2).mean(dim=-1).clamp_min(1e-8).sqrt()
-            return 20.0 * torch.log10((el + 1e-8) / (er + 1e-8))
-
-        def itc(x):
-            l, r = x[:, 0], x[:, 1]
-            l = l - l.mean(dim=-1, keepdim=True)
-            r = r - r.mean(dim=-1, keepdim=True)
-            num = (l * r).sum(dim=-1)
-            den = (l.norm(dim=-1) * r.norm(dim=-1)).clamp_min(1e-8)
-            return (num / den).clamp(-1, 1)
-
-        ild_err = (ild(pred) - ild(gt)).abs().mean().item()
-        itc_err = (itc(pred) - itc(gt)).abs().mean().item()
-        return {"ild_err_db": ild_err, "itc_err": itc_err}
-
-
-
 
 def train(cfg_path, data_root):
     cfg = load_config(cfg_path)
@@ -117,7 +75,7 @@ def train(cfg_path, data_root):
     sampler = DistributedSampler(dset) if use_ddp else None
     dl = DataLoader(dset, batch_size=cfg["batch_size"], shuffle=(sampler is None), sampler=sampler, num_workers=cfg["num_workers"], drop_last=True)
 
-    model = Lycodec(sr=sr,
+    model = Lycodec(sr=cfg["sample_rate"],
                     n_fft=cfg["stft"]["n_fft"],
                     hop=cfg["stft"]["hop_length"],
                     win=cfg["stft"]["win_length"],
@@ -127,11 +85,13 @@ def train(cfg_path, data_root):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    semantic_dim=cfg["model"].get("semantic_dim", 120),
                     decoder_depth=cfg["model"].get("decoder_depth", 6),
                     decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),
                     rvq_codebook_size=cfg["model"].get("rvq_codebook_size", 4096),
                     token_fps=cfg["model"].get("token_fps", 24),
+                    rvq_drop_start=cfg["model"].get("rvq_drop_start", 0.6),
+                    rvq_drop_end=cfg["model"].get("rvq_drop_end", 0.1),
+                    rvq_drop_decay_steps=cfg["model"].get("rvq_drop_decay_steps", 200000),
                     use_residual_corrector=cfg["model"].get("use_residual_corrector", True),
                     corrector_alpha=cfg["model"].get("corrector_alpha", 0.3),)
     model.to(device)
@@ -161,37 +121,13 @@ def train(cfg_path, data_root):
         for wav in pbar:
             wav = wav.to(device)  # [B, C, T]
 
-            # STFT auxiliary loss weight schedule (A-plan: higher weight for quality)
+            # STFT auxiliary loss weight schedule
             stft_weight = 0.0
             stft_sched = cfg["train"].get("stft_weight_schedule", [])
             for step_thr, w in stft_sched[::-1]:
                 if total_steps >= step_thr:
                     stft_weight = float(w)
                     break
-
-            # A-plan: RVQ dropout trio schedules (p_mask, p_jitter, p_bypass)
-            model_obj = model.module if use_ddp else model
-            if hasattr(model_obj, 'rvq'):
-                # Mask dropout schedule: 0.10 → 0.02 (linear decay)
-                mask_sched = cfg["train"].get("rvq_mask_schedule", [])
-                for step_thr, p in mask_sched[::-1]:
-                    if total_steps >= step_thr:
-                        model_obj.rvq.p_mask = p
-                        break
-
-                # Jitter dropout schedule: 0.20 → 0.05 (linear decay)
-                jitter_sched = cfg["train"].get("rvq_jitter_schedule", [])
-                for step_thr, p in jitter_sched[::-1]:
-                    if total_steps >= step_thr:
-                        model_obj.rvq.p_jitter = p
-                        break
-
-                # Bypass dropout schedule: 0.20 → 0.0 (linear decay)
-                bypass_sched = cfg["train"].get("rvq_bypass_schedule", [])
-                for step_thr, p in bypass_sched[::-1]:
-                    if total_steps >= step_thr:
-                        model_obj.rvq.p_bypass = p
-                        break
 
             if scaler is not None:
                 with torch.cuda.amp.autocast():
@@ -217,14 +153,14 @@ def train(cfg_path, data_root):
                     loss = loss + loss_consistency
 
                     # ============================================
-                    # A-plan: STFT loss (higher weight: 0.7)
+                    # STFT reconstruction loss
                     # ============================================
                     if rec is not None and stft_weight > 0:
                         loss_stft = stft_loss(rec, wav, cfg)
                         loss = loss + stft_weight * loss_stft
 
                     # ============================================
-                    # A-plan: RVQ losses
+                    # RVQ auxiliary losses
                     # ============================================
 
                     # RVQ commitment loss (encoder → codebook)
@@ -238,48 +174,27 @@ def train(cfg_path, data_root):
                         loss_ppx = rvq_perplexity_loss(enc["perplexity"], target_perplexity=target_ppx)
                         loss = loss + 0.001 * loss_ppx
 
-                    # ============================================
-                    # A-plan: Infill loss (mask dropout robustness)
-                    # ============================================
-                    if rec is not None and enc.get("bypass_applied", False) is False:
-                        # Only apply when mask/jitter dropout is active (not bypass)
+                    # Infill loss (skip when decoder consumed continuous latents)
+                    if rec is not None and not enc.get("dropout_applied", False):
                         infill_weight = cfg["train"].get("infill_weight", 0.3)
-                        loss_infill = infill_loss(rec, wav, cfg, bypass_applied=enc.get("bypass_applied", False))
+                        loss_infill = infill_loss(rec, wav, cfg, decoder_used_continuous=enc.get("dropout_applied", False))
                         loss = loss + infill_weight * loss_infill
 
-                    # ============================================
-                    # ResidualCorrector losses (if enabled)
-                    # ============================================
                     if hasattr(model_obj, 'corrector') and model_obj.corrector is not None:
-                        # Residual loss: train corrector to predict quantization error
-                        if "r_target" in enc and "r_hat" in enc and enc["r_target"] is not None:
+                        if enc.get("r_target") is not None and enc.get("r_hat") is not None:
                             residual_weight = cfg["train"].get("residual_weight", 1.0)
                             loss_residual = residual_loss(enc["r_hat"], enc["r_target"])
                             loss = loss + residual_weight * loss_residual
 
-                        # Alignment loss: align continuous and corrected representations
-                        if "z_continuous" in enc and enc["z_continuous"] is not None and "tokens" in enc:
+                        if enc.get("alignment_target") is not None and enc.get("y_disc") is not None:
                             align_weight = cfg["train"].get("alignment_weight", 0.1)
-                            use_cosine = cfg["train"].get("alignment_use_cosine", True)
-                            loss_align = alignment_loss(enc["z_continuous"], enc["tokens"], use_cosine=use_cosine)
+                            loss_align = alignment_loss(enc["y_disc"], enc["alignment_target"])
                             loss = loss + align_weight * loss_align
 
-                    # ============================================
-                    # Semantic supervision (optional, disabled by default)
-                    # ============================================
-                    # A-plan: Semantic losses applied to RVQ tokens if annotations available
-                    # Set use_semantic_supervision: true in config and provide labeled data
-
-                    # ============================================
-                    # Stereo head supervision (optional)
-                    # ============================================
-                    if cfg["train"].get("use_stereo_loss", False):
-                        try:
-                            pred_ild = model_obj.stereo(enc["tokens"])['ild']  # [B,T,1]
-                            tgt_ild = tokenwise_ild(wav, enc["tokens"]).to(pred_ild.device)
-                            loss = loss + 0.1 * ((pred_ild - tgt_ild) ** 2).mean()
-                        except Exception:
-                            pass
+                    if enc.get("summary_disc") is not None and enc.get("summary_cont") is not None:
+                        contrast_weight = cfg["train"].get("contrast_weight", 1.0)
+                        loss_contrast = summary_contrast_loss(enc["summary_disc"], enc["summary_cont"])
+                        loss = loss + contrast_weight * loss_contrast
 
                 # Normalize loss by accumulation steps
                 loss = loss / accum_steps
@@ -326,13 +241,13 @@ def train(cfg_path, data_root):
                 loss = loss + loss_consistency
 
                 # ============================================
-                # A-plan: STFT loss (higher weight: 0.7)
+                # STFT reconstruction loss
                 # ============================================
                 if rec is not None and stft_weight > 0:
                     loss = loss + stft_weight * stft_loss(rec, wav, cfg)
 
                 # ============================================
-                # A-plan: RVQ losses
+                # RVQ auxiliary losses
                 # ============================================
 
                 # RVQ commitment loss (encoder → codebook)
@@ -346,41 +261,27 @@ def train(cfg_path, data_root):
                     loss_ppx = rvq_perplexity_loss(enc["perplexity"], target_perplexity=target_ppx)
                     loss = loss + 0.001 * loss_ppx
 
-                # ============================================
-                # A-plan: Infill loss (mask dropout robustness)
-                # ============================================
-                if rec is not None and enc.get("bypass_applied", False) is False:
+                # Infill loss (skip when decoder consumed continuous latents)
+                if rec is not None and not enc.get("dropout_applied", False):
                     infill_weight = cfg["train"].get("infill_weight", 0.3)
-                    loss_infill = infill_loss(rec, wav, cfg, bypass_applied=enc.get("bypass_applied", False))
+                    loss_infill = infill_loss(rec, wav, cfg, decoder_used_continuous=enc.get("dropout_applied", False))
                     loss = loss + infill_weight * loss_infill
 
-                # ============================================
-                # ResidualCorrector losses (if enabled)
-                # ============================================
                 if hasattr(model_obj, 'corrector') and model_obj.corrector is not None:
-                    # Residual loss: train corrector to predict quantization error
-                    if "r_target" in enc and "r_hat" in enc and enc["r_target"] is not None:
+                    if enc.get("r_target") is not None and enc.get("r_hat") is not None:
                         residual_weight = cfg["train"].get("residual_weight", 1.0)
                         loss_residual = residual_loss(enc["r_hat"], enc["r_target"])
                         loss = loss + residual_weight * loss_residual
 
-                    # Alignment loss: align continuous and corrected representations
-                    if "z_continuous" in enc and enc["z_continuous"] is not None and "tokens" in enc:
+                    if enc.get("alignment_target") is not None and enc.get("y_disc") is not None:
                         align_weight = cfg["train"].get("alignment_weight", 0.1)
-                        use_cosine = cfg["train"].get("alignment_use_cosine", True)
-                        loss_align = alignment_loss(enc["z_continuous"], enc["tokens"], use_cosine=use_cosine)
+                        loss_align = alignment_loss(enc["y_disc"], enc["alignment_target"])
                         loss = loss + align_weight * loss_align
 
-                # ============================================
-                # Stereo head supervision (optional)
-                # ============================================
-                if cfg["train"].get("use_stereo_loss", False):
-                    try:
-                        pred_ild = model_obj.stereo(enc["tokens"])['ild']  # [B,T,1]
-                        tgt_ild = tokenwise_ild(wav, enc["tokens"]).to(pred_ild.device)
-                        loss = loss + 0.1 * ((pred_ild - tgt_ild) ** 2).mean()
-                    except Exception:
-                        pass
+                if enc.get("summary_disc") is not None and enc.get("summary_cont") is not None:
+                    contrast_weight = cfg["train"].get("contrast_weight", 1.0)
+                    loss_contrast = summary_contrast_loss(enc["summary_disc"], enc["summary_cont"])
+                    loss = loss + contrast_weight * loss_contrast
 
                 # Normalize loss by accumulation steps
                 loss = loss / accum_steps
@@ -440,11 +341,13 @@ def load_model(ckpt_path, cfg_path):
                     heads=cfg["model"]["heads"],
                     use_checkpoint=cfg["train"].get("use_checkpoint", False),
                     use_rope=cfg["model"].get("use_rope", True),
-                    semantic_dim=cfg["model"].get("semantic_dim", 120),
                     decoder_depth=cfg["model"].get("decoder_depth", 6),
                     decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),
                     rvq_codebook_size=cfg["model"].get("rvq_codebook_size", 4096),
                     token_fps=cfg["model"].get("token_fps", 24),
+                    rvq_drop_start=cfg["model"].get("rvq_drop_start", 0.6),
+                    rvq_drop_end=cfg["model"].get("rvq_drop_end", 0.1),
+                    rvq_drop_decay_steps=cfg["model"].get("rvq_drop_decay_steps", 200000),
                     use_residual_corrector=cfg["model"].get("use_residual_corrector", True),
                     corrector_alpha=cfg["model"].get("corrector_alpha", 0.3),)
     if ckpt_path and os.path.exists(ckpt_path):
