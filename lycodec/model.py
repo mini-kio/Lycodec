@@ -7,7 +7,6 @@ from lycodec.core.blocks import (
     TemporalResampler,
     RVQQuantizer,
     ResidualCorrector,
-    HybridLatent,
     StereoHead,
 )
 from lycodec.core.decoders import TokenConditioner, TransformerDecoder2D, BandSplitHead, edm_parameterization

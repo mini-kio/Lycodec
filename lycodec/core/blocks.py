@@ -463,26 +463,6 @@ class ResidualCorrector(nn.Module):
         return r_hat
 
 
-class HybridLatent(nn.Module):
-    def __init__(self, dim=256):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.ones(1))
-        self.residual_net = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim * 2, dim),
-        )
-
-    def forward(self, z_cont, z_quant):
-        if z_quant is None:
-            return z_cont, z_cont
-        residual = z_cont - z_quant
-        residual = self.residual_net(residual)
-        z_h = z_quant + self.alpha * residual
-        return z_h, residual
-
-
 class StereoHead(nn.Module):
     def __init__(self, dim=256):
         super().__init__()
