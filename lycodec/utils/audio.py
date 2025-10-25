@@ -107,3 +107,66 @@ def resample_time(x, t_out):
     x0 = x[:, :, idx0]
     x1 = x[:, :, idx1]
     return x0 * (1 - w) + x1 * w
+
+
+def stereo_metrics_inline(target, pred, eps=1e-8):
+    """
+    Compute stereo audio quality metrics for logging.
+
+    Args:
+        target: [B, C, T] original audio
+        pred: [B, C, T] reconstructed audio
+        eps: small constant for numerical stability
+
+    Returns:
+        dict with metric names and float values
+    """
+    metrics = {}
+
+    # Align tensor lengths if needed
+    min_len = min(target.shape[-1], pred.shape[-1])
+    target = target[..., :min_len]
+    pred = pred[..., :min_len]
+
+    # MSE (Mean Squared Error)
+    mse = F.mse_loss(pred, target)
+    metrics['mse'] = float(mse.item())
+
+    # L1 Loss
+    l1 = F.l1_loss(pred, target)
+    metrics['l1'] = float(l1.item())
+
+    # SI-SDR (Scale-Invariant Signal-to-Distortion Ratio)
+    # Compute per sample, then average
+    target_flat = target.reshape(target.shape[0], -1)
+    pred_flat = pred.reshape(pred.shape[0], -1)
+
+    # Project pred onto target
+    alpha = (target_flat * pred_flat).sum(dim=1, keepdim=True) / (target_flat.pow(2).sum(dim=1, keepdim=True) + eps)
+    target_scaled = alpha * target_flat
+
+    # Signal and noise
+    noise = pred_flat - target_scaled
+    si_sdr = 10 * torch.log10((target_scaled.pow(2).sum(dim=1) + eps) / (noise.pow(2).sum(dim=1) + eps))
+    metrics['si_sdr'] = float(si_sdr.mean().item())
+
+    # Stereo correlation (measures stereo field preservation)
+    if target.shape[1] == 2:  # Only for stereo
+        # Correlation between left and right channels
+        def channel_corr(x):
+            left = x[:, 0, :]  # [B, T]
+            right = x[:, 1, :]  # [B, T]
+            left_centered = left - left.mean(dim=-1, keepdim=True)
+            right_centered = right - right.mean(dim=-1, keepdim=True)
+            corr = (left_centered * right_centered).sum(dim=-1) / (
+                torch.sqrt(left_centered.pow(2).sum(dim=-1) * right_centered.pow(2).sum(dim=-1)) + eps
+            )
+            return corr.mean()
+
+        corr_target = channel_corr(target)
+        corr_pred = channel_corr(pred)
+        metrics['stereo_corr_target'] = float(corr_target.item())
+        metrics['stereo_corr_pred'] = float(corr_pred.item())
+        metrics['stereo_corr_diff'] = float(abs(corr_target - corr_pred).item())
+
+    return metrics

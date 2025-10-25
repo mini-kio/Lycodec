@@ -17,6 +17,7 @@ from lycodec.utils.losses import (
     alignment_loss,
     summary_contrast_loss,
 )
+from lycodec.utils.audio import stereo_metrics_inline
 
 
 def load_config(path):
