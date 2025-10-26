@@ -2,18 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lycodec.utils.audio import resample_time
+from lycodec.core.common_blocks import ConvNormAct2d, ConvNormAct1d
 
 
 class ConvBlock2d(nn.Module):
     def __init__(self, c_in, c_out, stride=(1, 1)):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(c_in, c_out, 3, stride=stride, padding=1),
-            nn.GroupNorm(8, c_out),
-            nn.SiLU(),
-            nn.Conv2d(c_out, c_out, 3, padding=1),
-            nn.GroupNorm(8, c_out),
-            nn.SiLU(),
+            ConvNormAct2d(c_in, c_out, kernel_size=3, stride=stride, padding=1),
+            ConvNormAct2d(c_out, c_out, kernel_size=3, padding=1),
         )
 
     def forward(self, x):
@@ -206,32 +203,34 @@ class RVQQuantizer(nn.Module):
     def _update_ema(self, z, indices):
         if not self.training:
             return
-        z_flat = z.reshape(-1, self.dim)
-        indices_flat = indices.reshape(-1)
-        encodings = F.one_hot(indices_flat, num_classes=self.K).float()
-        n_i = encodings.sum(dim=0)
-        self.ema_cluster_size.mul_(self.ema_decay).add_(n_i, alpha=1 - self.ema_decay)
-        sum_i = encodings.t() @ z_flat
-        self.ema_embed_avg.mul_(self.ema_decay).add_(sum_i, alpha=1 - self.ema_decay)
-        n = self.ema_cluster_size.sum()
-        cluster_size = (self.ema_cluster_size + 1e-5) / (n + self.K * 1e-5) * n
-        self.codebook.copy_(self.ema_embed_avg / cluster_size.unsqueeze(1))
-        self.codebook_usage.mul_(0.99)
-        self.codebook_usage += n_i
+        with torch.no_grad():
+            z_flat = z.reshape(-1, self.dim)
+            indices_flat = indices.reshape(-1)
+            encodings = F.one_hot(indices_flat, num_classes=self.K).float()
+            n_i = encodings.sum(dim=0)
+            self.ema_cluster_size.mul_(self.ema_decay).add_(n_i, alpha=1 - self.ema_decay)
+            sum_i = encodings.t() @ z_flat
+            self.ema_embed_avg.mul_(self.ema_decay).add_(sum_i, alpha=1 - self.ema_decay)
+            n = self.ema_cluster_size.sum()
+            cluster_size = (self.ema_cluster_size + 1e-5) / (n + self.K * 1e-5) * n
+            self.codebook.copy_(self.ema_embed_avg / cluster_size.unsqueeze(1))
+            self.codebook_usage.mul_(0.99)
+            self.codebook_usage += n_i
 
     def _awaken_dead_codes(self, z):
         if not self.training:
             return
-        dead_mask = self.codebook_usage < 1.0
-        num_dead = int(dead_mask.sum().item())
-        if num_dead == 0:
-            return
-        z_flat = z.reshape(-1, self.dim)
-        random_idx = torch.randperm(z_flat.shape[0], device=z.device)[:num_dead]
-        self.codebook[dead_mask] = z_flat[random_idx] + torch.randn(num_dead, self.dim, device=z.device) * 0.01
-        self.codebook_usage[dead_mask] = 1.0
-        self.ema_cluster_size[dead_mask] = 1.0
-        self.ema_embed_avg[dead_mask] = self.codebook[dead_mask]
+        with torch.no_grad():
+            dead_mask = self.codebook_usage < 1.0
+            num_dead = int(dead_mask.sum().item())
+            if num_dead == 0:
+                return
+            z_flat = z.reshape(-1, self.dim)
+            random_idx = torch.randperm(z_flat.shape[0], device=z.device)[:num_dead]
+            self.codebook[dead_mask] = z_flat[random_idx] + torch.randn(num_dead, self.dim, device=z.device) * 0.01
+            self.codebook_usage[dead_mask] = 1.0
+            self.ema_cluster_size[dead_mask] = 1.0
+            self.ema_embed_avg[dead_mask] = self.codebook[dead_mask]
 
     def _current_drop_prob(self):
         if self.drop_decay_steps <= 0:
@@ -255,9 +254,15 @@ class RVQQuantizer(nn.Module):
             hard_indices = indices
             embedding = F.embedding(hard_indices, self.codebook)
             self._update_ema(z, hard_indices)
-            self.step_counter += 1
-            if self.step_counter % self.awakening_steps == 0:
+
+            with torch.no_grad():
+                self.step_counter += 1
+
+            # Safe tensor comparison for awakening
+            step = int(self.step_counter.item())
+            if self.awakening_steps > 0 and step > 0 and (step % self.awakening_steps == 0):
                 self._awaken_dead_codes(z)
+
             drop_prob = self._current_drop_prob()
         else:
             hard_indices = distances.argmin(dim=-1)
@@ -292,12 +297,8 @@ class ResidualCorrector(nn.Module):
         self.context_size = context_size
         self.index_embed = nn.Embedding(codebook_size, dim)
         self.context_conv = nn.Sequential(
-            nn.Conv1d(dim, dim, kernel_size=context_size, padding=context_size // 2),
-            nn.GroupNorm(8, dim),
-            nn.SiLU(),
-            nn.Conv1d(dim, dim, kernel_size=context_size, padding=context_size // 2),
-            nn.GroupNorm(8, dim),
-            nn.SiLU(),
+            ConvNormAct1d(dim, dim, kernel_size=context_size, padding=context_size // 2),
+            ConvNormAct1d(dim, dim, kernel_size=context_size, padding=context_size // 2),
         )
         self.predictor = nn.Sequential(
             nn.Linear(dim, dim * 2),
@@ -317,24 +318,7 @@ class ResidualCorrector(nn.Module):
 
 
 class RotaryPositionEmbedding(nn.Module):
-    """
-    Rotary Position Embedding (RoPE) from "RoFormer: Enhanced Transformer with Rotary Position Embedding".
-
-    Instead of adding position encodings, RoPE rotates the query and key vectors
-    based on their absolute positions. This preserves relative position information
-    while being more efficient than learned position embeddings.
-
-    Key properties:
-    - Encodes absolute position with rotation matrix
-    - Naturally captures relative positions through inner products
-    - No additional parameters (uses precomputed frequencies)
-    - Works well for extrapolation to longer sequences
-
-    Example:
-        rope = RotaryPositionEmbedding(dim=512, max_seq_len=18)
-        x = torch.randn(8, 18, 512)  # [B, T, D]
-        x_rotated = rope(x)
-    """
+    """Rotary Position Embedding (RoPE) for transformer positional encoding."""
     def __init__(self, dim, max_seq_len=1024, base=10000):
         super().__init__()
         assert dim % 2 == 0, f"dim must be even for RoPE, got {dim}"
@@ -374,32 +358,16 @@ class RotaryPositionEmbedding(nn.Module):
             self.sin_cached = emb.sin().unsqueeze(0)  # [1, seq_len, dim]
 
     def _rotate_half(self, x):
-        """
-        Rotate half the hidden dims of the input.
-
-        For a vector [x0, x1, x2, x3, ...], this returns [-x1, x0, -x3, x2, ...].
-        This is the core rotation operation for RoPE.
-        """
+        """Rotate half the hidden dims: [x0,x1,x2,x3,...] -> [-x1,x0,-x3,x2,...]"""
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
     def forward(self, x):
-        """
-        Apply rotary position embedding to input.
-
-        Args:
-            x: input tensor [B, seq_len, dim]
-
-        Returns:
-            x_rotated: [B, seq_len, dim] with position information encoded via rotation
-        """
+        """Apply rotary position embedding. x: [B, seq_len, dim] -> [B, seq_len, dim]"""
         seq_len = x.shape[1]
         self._update_cache(seq_len, x.device)
 
-        # Get cached cos/sin for current sequence length
-        cos = self.cos_cached[:, :seq_len, :]  # [1, seq_len, dim]
-        sin = self.sin_cached[:, :seq_len, :]  # [1, seq_len, dim]
+        cos = self.cos_cached[:, :seq_len, :].to(x.dtype)
+        sin = self.sin_cached[:, :seq_len, :].to(x.dtype)
 
-        # Apply rotation: x_rotated = x * cos + rotate_half(x) * sin
-        # This is equivalent to multiplying by a rotation matrix
         return x * cos + self._rotate_half(x) * sin

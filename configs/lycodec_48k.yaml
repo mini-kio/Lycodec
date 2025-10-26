@@ -6,11 +6,11 @@ stft:
 crop_seconds: 1.5
 chunk_seconds: 1.5
 hop_seconds: 0.75
-batch_size: 8
-epochs: 2
+batch_size: 4
+epochs: 2000
 lr: 0.0001
 device: cuda
-num_workers: 4
+num_workers: 12
 save_every: 1000
 model:
   hidden_dim: 512
@@ -49,7 +49,6 @@ train:
   sigma_max: 80.0
   rho: 7.0
 
-  ddp: false
   use_checkpoint: true
   ema:
     enabled: true

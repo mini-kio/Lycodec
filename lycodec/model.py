@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from lycodec.utils.audio import wav_to_spec, spec_to_wav
+from lycodec.utils.common import to_tensor
 from lycodec.core.blocks import (
     Patchifier,
     TransformerEncoder,
@@ -101,7 +102,8 @@ class Lycodec(nn.Module):
         z_continuous = self.to_token(z)
 
         y_cont = self.shared_proj(z_continuous)
-        y_cont_detached = self.shared_proj(z_continuous.detach())
+        # Two-stage detach: input detach + output detach to completely cut graph
+        y_cont_target = self.shared_proj(z_continuous.detach()).detach()
 
         rvq_out = self.rvq(z_continuous, training=self.training)
         y_disc = self.shared_proj(rvq_out['embedding'])
@@ -114,7 +116,7 @@ class Lycodec(nn.Module):
             if r_hat is not None:
                 y_disc_corrected = y_disc + self.corrector_alpha * r_hat
             if self.training:
-                r_target = y_cont_detached - y_disc.detach()
+                r_target = y_cont_target - y_disc.detach()
 
         drop_prob = float(rvq_out['drop_prob']) if self.training else 0.0
         dropout_applied = False
@@ -124,8 +126,10 @@ class Lycodec(nn.Module):
                 tokens_for_decoder = y_cont
                 dropout_applied = True
 
-        summary_disc = self._summary_head(y_disc)
-        summary_cont = self._summary_head(y_cont_detached if self.training else y_cont)
+        # Use corrected path for discrete summary to ensure gradient flow
+        summary_disc = self._summary_head(y_disc_corrected)
+        # Use completely detached target for continuous summary
+        summary_cont = self._summary_head(y_cont_target)
 
         return {
             "tokens": tokens_for_decoder,
@@ -135,9 +139,9 @@ class Lycodec(nn.Module):
             "usage_entropy": rvq_out['usage_entropy'],
             "dropout_applied": dropout_applied,
             "drop_prob": drop_prob,
-            "y_disc": y_disc,
+            "y_disc": y_disc_corrected,
             "y_disc_corrected": y_disc_corrected,
-            "alignment_target": y_cont_detached if self.training else None,
+            "alignment_target": y_cont_target if self.training else None,
             "r_target": r_target,
             "r_hat": r_hat,
             "z_continuous": z_continuous if self.training else None,
@@ -146,76 +150,38 @@ class Lycodec(nn.Module):
         }
 
     def decode(self, tokens, length, sigma=None, spec_init=None):
-        """
-        Consistency model decoder.
-
-        Args:
-            tokens: encoded tokens [B, T, D]
-            length: target waveform length
-            sigma: noise level [B] or scalar. If None, uses minimal noise (1e-3) for one-step inference
-            spec_init: initial spectrogram x_sigma [B, 4, F, T] to feed the consistency function.
-                       If None, starts from pure noise scaled by sigma (inference path).
-
-        Returns:
-            reconstructed waveform
-        """
+        """Consistency model decoder. Returns reconstructed waveform."""
         b = tokens.shape[0]
         device = tokens.device
 
-        # Set default sigma for inference (one-step generation from minimal noise)
         if sigma is None:
             sigma = torch.ones(b, device=device) * 1e-3
+        else:
+            sigma = to_tensor(sigma, batch_size=b, device=device, dtype=torch.float32)
 
-        if not torch.is_tensor(sigma):
-            sigma = torch.tensor([sigma] * b, device=device, dtype=torch.float32)
-
-        # Get conditioning with noise level
         cond = self.cond(tokens, sigma)
-
-        # Determine target spectrogram time length from conditioner
         t_out = cond.shape[-1]
         f_bins = self.n_fft // 2 + 1
 
-        # Prepare initial spectrogram x_sigma
         if spec_init is None:
-            # Inference: start from pure noise (one-step generation)
             spec_noisy = torch.randn(b, 4, f_bins, t_out, device=device) * sigma.view(b, 1, 1, 1)
         else:
-            # Use provided initial spectrogram (e.g., clean+noise for training)
             spec_noisy = spec_init
-            # Align freq/time dims if needed
             if spec_noisy.shape[-2] != f_bins or spec_noisy.shape[-1] != t_out:
                 import torch.nn.functional as F
-                # Only interpolate along time/freq axes to match network expectations
                 spec_noisy = F.interpolate(spec_noisy, size=(f_bins, t_out), mode='bilinear', align_corners=False)
 
-        # EDM parameterization for consistency model
         c_skip, c_out, c_in, _ = edm_parameterization(sigma, sigma_data=0.5)
-
-        # Scale input
         spec_in = spec_noisy * c_in
-
-        # Transformer decoder prediction with cross-attention
         F_theta = self.decoder(spec_in, cond, tokens=tokens, sigma=sigma)
-
-        # Consistency function: f(x_σ, σ) = c_skip * x_σ + c_out * F_θ(x_σ, σ)
         spec_pred = c_skip * spec_noisy + c_out * F_theta
-
-        # Band-split refinement
         spec_pred = self.bands(spec_pred)
-
-        # Convert to waveform
         wav = spec_to_wav(spec_pred, self.n_fft, self.hop, self.win, length=length)
         return wav
 
     def forward(self, wav, decode=True):
-        # Get clean spectrogram for consistency loss
         spec_clean = wav_to_spec(wav, self.n_fft, self.hop, self.win)
-
         enc = self.encode(wav)
         rec = self.decode(enc["tokens"], wav.shape[-1]) if decode else None
-
-        # Return spec_clean for consistency loss
-        enc["spec_clean"] = spec_clean
-
+        enc["spec_clean"] = spec_clean.detach()
         return rec, enc

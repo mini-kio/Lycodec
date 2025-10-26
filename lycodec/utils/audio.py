@@ -27,15 +27,16 @@ def stft(x, n_fft=2048, hop_length=640, win_length=2048):
     is_batched = x.ndim == 3
     if is_batched:
         b, c, t = x.shape
-        x = x.reshape(b * c, t)  # [B*C, T]
+        x = x.reshape(b * c, t)
 
-    win = torch.hann_window(win_length, device=x.device, dtype=x.dtype)
-    X = torch.stft(x, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
+    # Force float32 for STFT to avoid fp16 issues in AMP
+    x32 = x.float()
+    win = torch.hann_window(win_length, device=x.device, dtype=torch.float32)
+    X = torch.stft(x32, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
                    window=win, return_complex=True, center=True, pad_mode="reflect")
-    # X: [B*C, F, T_out]
 
     if is_batched:
-        X = X.reshape(b, c, X.shape[1], X.shape[2])  # [B, C, F, T_out]
+        X = X.reshape(b, c, X.shape[1], X.shape[2])
 
     return X
 
@@ -51,16 +52,15 @@ def istft(X, n_fft=2048, hop_length=640, win_length=2048, length=None):
     is_batched = X.ndim == 4
     if is_batched:
         b, c, f, t = X.shape
-        X = X.reshape(b * c, f, t)  # [B*C, F, T]
+        X = X.reshape(b * c, f, t)
 
-    # Window must be real dtype
+    # Force float32 for ISTFT
     win = torch.hann_window(win_length, device=X.device, dtype=torch.float32)
     x = torch.istft(X, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
                     window=win, length=length, center=True)
-    # x: [B*C, T_out]
 
     if is_batched:
-        x = x.reshape(b, c, x.shape[1])  # [B, C, T_out]
+        x = x.reshape(b, c, x.shape[1])
 
     return x
 
@@ -76,13 +76,6 @@ def spec_unpack(spec):
     s = spec[:, 2] + 1j * spec[:, 3]
     out = torch.stack([m, s], dim=1)
     return out
-
-
-def amp_phase_transform(spec, beta=1.0, p=0.5):
-    a = torch.clamp(spec.abs(), 1e-8) ** p
-    # Use torch.is_complex to check dtype reliably
-    ang = torch.atan2(spec[..., 1], spec[..., 0]) if torch.is_complex(spec) else 0
-    return a, ang
 
 
 def wav_to_spec(x, n_fft=2048, hop_length=640, win_length=2048):

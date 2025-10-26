@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from lycodec.utils.audio import resample_time
+from lycodec.utils.common import compute_noise_embedding, to_tensor
+from lycodec.core.common_blocks import ConvNormAct2d, ConvTransposeNormAct2d
 
 
 def edm_parameterization(sigma, sigma_data=0.5):
@@ -27,7 +29,7 @@ def edm_parameterization(sigma, sigma_data=0.5):
     c_skip = sigma_data_sq / (sigma_sq + sigma_data_sq)
     c_out = sigma * sigma_data / torch.sqrt(sigma_sq + sigma_data_sq)
     c_in = 1.0 / torch.sqrt(sigma_sq + sigma_data_sq)
-    c_noise = 0.25 * torch.log(sigma.squeeze())
+    c_noise = compute_noise_embedding(sigma, reshape=False)
 
     return c_skip, c_out, c_in, c_noise
 
@@ -56,16 +58,15 @@ class TokenConditioner(nn.Module):
             conditioning [B, C, F, T]
         """
         b, t, d = z.shape
-        z = self.proj(z)       # [B, T, C]
-        z = z.transpose(1, 2)  # [B, C, T]
+        z = self.proj(z)
+        z = z.transpose(1, 2)
         z = resample_time(z, self.t_out)
-        z = z.unsqueeze(2).expand(b, z.shape[1], self.f_bins, self.t_out)
+        z = z.unsqueeze(2).expand(b, z.shape[1], self.f_bins, self.t_out).contiguous()
 
         # Add noise conditioning if provided
         if sigma is not None:
-            if not torch.is_tensor(sigma):
-                sigma = torch.tensor([sigma], device=z.device)
-            c_noise = 0.25 * torch.log(sigma.view(-1, 1))  # [B, 1]
+            sigma_tensor = to_tensor(sigma, device=z.device)
+            c_noise = compute_noise_embedding(sigma_tensor, reshape=True)  # [B, 1]
             noise_emb = self.noise_embed(c_noise)  # [B, C]
             noise_emb = noise_emb.view(b, -1, 1, 1).expand(-1, -1, self.f_bins, self.t_out)
             z = z + noise_emb
@@ -83,9 +84,7 @@ class BandSplitHead(nn.Module):
 
         # Low band (base) head
         self.low_head = nn.Sequential(
-            nn.Conv2d(c_in, 32, 3, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
+            ConvNormAct2d(c_in, 32, kernel_size=3, padding=1),
             nn.Conv2d(32, 4, 1),
         )
 
@@ -98,22 +97,21 @@ class BandSplitHead(nn.Module):
 
         # High band head (conditioned on low)
         self.high_head = nn.Sequential(
-            nn.Conv2d(c_in + 16, 32, 3, padding=1),  # +16 from low conditioning
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
+            ConvNormAct2d(c_in + 16, 32, kernel_size=3, padding=1),
             nn.Conv2d(32, 4, 1),
         )
 
-        # Learnable blending weight (starts at 0.5 for low, 0.5 for high)
+        # Learnable blending weight
         self.blend_weight = nn.Parameter(torch.tensor([0.5, 0.5]))
 
-    def _mask(self, f_bins, device):
-        """Create frequency masks for low/high bands."""
-        nyq = self.sr / 2
-        freqs = torch.linspace(0, nyq, f_bins, device=device)
-        low = (freqs <= self.split_hz).float().view(1, 1, f_bins, 1)
-        high = 1.0 - low
-        return low, high
+        # Cache frequency masks for expected f_bins (n_fft//2 + 1)
+        f_bins = n_fft // 2 + 1
+        nyq = sr / 2
+        freqs = torch.linspace(0, nyq, f_bins)
+        low_mask = (freqs <= split_hz).float().view(1, 1, f_bins, 1)
+        high_mask = 1.0 - low_mask
+        self.register_buffer('low_mask_cached', low_mask)
+        self.register_buffer('high_mask_cached', high_mask)
 
     def forward(self, x):
         """
@@ -124,7 +122,10 @@ class BandSplitHead(nn.Module):
             refined prediction with band-split [B, 4, F, T]
         """
         b, c, f, t = x.shape
-        low_mask, high_mask = self._mask(f, x.device)
+
+        # Use cached masks (already on correct device via buffer)
+        low_mask = self.low_mask_cached
+        high_mask = self.high_mask_cached
 
         # Low band (base reconstruction)
         low = self.low_head(x) * low_mask
@@ -304,6 +305,10 @@ class Unpatchify(nn.Module):
         self.patch_size = patch_size
         self.target_size = target_size
 
+        # Validate patch_size is power of 2
+        if patch_size & (patch_size - 1) != 0 or patch_size == 0:
+            raise ValueError(f"patch_size must be a power of 2, got {patch_size}")
+
         # Calculate number of upsampling stages
         num_stages = int(math.log2(patch_size))
 
@@ -312,21 +317,19 @@ class Unpatchify(nn.Module):
         current_dim = embed_dim
 
         for i in range(num_stages):
-            next_dim = current_dim // 2 if i < num_stages - 1 else 64
-            layers.extend([
-                nn.ConvTranspose2d(
+            next_dim = current_dim // 2 if i < num_stages - 1 else 32
+            layers.append(
+                ConvTransposeNormAct2d(
                     current_dim, next_dim,
                     kernel_size=4, stride=2, padding=1
-                ),
-                nn.GroupNorm(8, next_dim),
-                nn.SiLU(),
-            ])
+                )
+            )
             current_dim = next_dim
 
         self.upsample = nn.Sequential(*layers)
 
         # Final projection to output channels
-        self.final_proj = nn.Conv2d(64, c_out, kernel_size=3, padding=1)
+        self.final_proj = nn.Conv2d(32, c_out, kernel_size=3, padding=1)
 
     def forward(self, x, grid_size):
         """
@@ -394,7 +397,7 @@ class TransformerDecoder2D(nn.Module):
         mlp_ratio=4.0,
         dropout=0.0,
         target_size=(1025, 113),
-        max_token_len=24,  # NEW: max token sequence length (changed from 18 to 24)
+        max_token_len=24,
     ):
         super().__init__()
         self.c_in = c_in
@@ -426,7 +429,6 @@ class TransformerDecoder2D(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
 
         # Learnable positional encoding for tokens
-        # NEW: now supports variable token lengths (24 fps instead of 18)
         self.token_pos_embed = nn.Parameter(torch.randn(1, max_token_len, embed_dim) * 0.02)
 
         # Transformer decoder blocks
@@ -481,8 +483,8 @@ class TransformerDecoder2D(nn.Module):
         if sigma is None:
             # Default to minimal noise for inference
             sigma = torch.ones(B, device=device) * 1e-3
-        if not torch.is_tensor(sigma):
-            sigma = torch.tensor([sigma] * B, device=device, dtype=torch.float32)
+        else:
+            sigma = to_tensor(sigma, batch_size=B, device=device, dtype=torch.float32)
 
         # Create noise embedding
         sigma_input = sigma.view(-1, 1)  # [B, 1]
@@ -499,13 +501,14 @@ class TransformerDecoder2D(nn.Module):
 
         # Prepare token conditioning
         if tokens is not None:
-            # Project tokens to transformer dimension
-            tokens_proj = self.token_proj(tokens)  # [B, N_tokens, embed_dim]
-            tokens_proj = tokens_proj + self.token_pos_embed
+            tokens_proj = self.token_proj(tokens)
+            n_tok = tokens_proj.shape[1]
+            pos = self.token_pos_embed[:, :n_tok, :]
+            tokens_proj = tokens_proj + pos
         else:
-            # Fallback: create dummy tokens (for compatibility if tokens not provided)
-            # In practice, tokens should always be provided for best results
-            tokens_proj = torch.zeros(B, 18, self.embed_dim, device=device)
+            # Fallback: create dummy tokens if not provided
+            max_tok = self.token_pos_embed.shape[1]
+            tokens_proj = torch.zeros(B, max_tok, self.embed_dim, device=device)
 
         # Apply transformer blocks
         for block in self.blocks:
