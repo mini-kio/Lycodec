@@ -2,8 +2,108 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lycodec.utils.audio import resample_time
-from lycodec.core.common_blocks import ConvNormAct2d, ConvNormAct1d
 
+
+# ============================================================================
+# Common Neural Network Building Blocks
+# ============================================================================
+
+class ConvNormAct2d(nn.Module):
+    """Conv2d -> GroupNorm -> SiLU activation block."""
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        groups=8,
+        bias=True,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=bias,
+            ),
+            nn.GroupNorm(groups, out_channels),
+            nn.SiLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ConvNormAct1d(nn.Module):
+    """Conv1d -> GroupNorm -> SiLU activation block."""
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        groups=8,
+        bias=True,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=bias,
+            ),
+            nn.GroupNorm(groups, out_channels),
+            nn.SiLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ConvTransposeNormAct2d(nn.Module):
+    """ConvTranspose2d -> GroupNorm -> SiLU activation block."""
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=4,
+        stride=2,
+        padding=1,
+        groups=8,
+        bias=True,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=bias,
+            ),
+            nn.GroupNorm(groups, out_channels),
+            nn.SiLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ============================================================================
+# Encoder Components
+# ============================================================================
 
 class ConvBlock2d(nn.Module):
     def __init__(self, c_in, c_out, stride=(1, 1)):
@@ -163,7 +263,7 @@ class TemporalResampler(nn.Module):
 class RVQQuantizer(nn.Module):
     """Residual Vector Quantizer with EMA updates and dropout scheduling."""
 
-    def __init__(self, dim=256, codebook_size=4096, ema_decay=0.99, awakening_steps=2000,
+    def __init__(self, dim=256, codebook_size=4096, ema_decay=0.97, awakening_steps=200,
                  gumbel_temp=1.0, drop_start=0.6, drop_end=0.1, drop_decay_steps=200000):
         super().__init__()
         self.dim = dim
@@ -184,11 +284,18 @@ class RVQQuantizer(nn.Module):
         print(f"[RVQ] Initialized: K={codebook_size}, dim={dim}, drop {self.drop_start}->{self.drop_end}")
 
     def _compute_distances(self, z):
+        """
+        Compute distances using L2 normalized vectors and cosine distance.
+        This helps prevent codebook collapse by maintaining better code utilization.
+        """
         z_flat = z.reshape(-1, self.dim)
-        z_norm_sq = (z_flat ** 2).sum(dim=-1, keepdim=True)
-        e_norm_sq = (self.codebook ** 2).sum(dim=-1, keepdim=True).t()
-        dot = z_flat @ self.codebook.t()
-        distances = z_norm_sq + e_norm_sq - 2 * dot
+        # L2 normalize both input and codebook
+        z_norm = F.normalize(z_flat, dim=-1)
+        codebook_norm = F.normalize(self.codebook, dim=-1)
+        # Cosine distance = 1 - cosine_similarity
+        # This is more stable than euclidean distance
+        cosine_sim = z_norm @ codebook_norm.t()
+        distances = 1.0 - cosine_sim
         return distances.reshape(z.shape[0], z.shape[1], self.K)
 
     def _gumbel_softmax_st(self, logits, tau):
@@ -218,17 +325,39 @@ class RVQQuantizer(nn.Module):
             self.codebook_usage += n_i
 
     def _awaken_dead_codes(self, z):
+        """
+        More aggressive awakening strategy to prevent codebook collapse.
+        Resets codes below 10% of average usage (was 1.0 absolute threshold).
+        """
         if not self.training:
             return
         with torch.no_grad():
-            dead_mask = self.codebook_usage < 1.0
+            # Use relative threshold (10% of average usage) instead of absolute
+            usage_threshold = self.codebook_usage.mean() * 0.1
+            dead_mask = self.codebook_usage < usage_threshold
             num_dead = int(dead_mask.sum().item())
             if num_dead == 0:
                 return
+
+            # Reset at least 10 codes or 5% of codebook, whichever is larger
+            min_reset = max(10, int(self.K * 0.05))
+            if num_dead < min_reset:
+                # Find additional low-usage codes to reset
+                _, indices = torch.topk(self.codebook_usage, min_reset, largest=False)
+                dead_mask = torch.zeros(self.K, dtype=torch.bool, device=z.device)
+                dead_mask[indices] = True
+                num_dead = min_reset
+
             z_flat = z.reshape(-1, self.dim)
-            random_idx = torch.randperm(z_flat.shape[0], device=z.device)[:num_dead]
-            self.codebook[dead_mask] = z_flat[random_idx] + torch.randn(num_dead, self.dim, device=z.device) * 0.01
-            self.codebook_usage[dead_mask] = 1.0
+            # Handle case where num_dead > available samples (use replacement sampling)
+            if num_dead > z_flat.shape[0]:
+                random_idx = torch.randint(0, z_flat.shape[0], (num_dead,), device=z.device)
+            else:
+                random_idx = torch.randperm(z_flat.shape[0], device=z.device)[:num_dead]
+
+            # Reset codes with small noise
+            self.codebook[dead_mask] = z_flat[random_idx] + torch.randn(num_dead, self.dim, device=z.device) * 0.02
+            self.codebook_usage[dead_mask] = self.codebook_usage.mean()  # Set to average, not 1.0
             self.ema_cluster_size[dead_mask] = 1.0
             self.ema_embed_avg[dead_mask] = self.codebook[dead_mask]
 
@@ -248,8 +377,15 @@ class RVQQuantizer(nn.Module):
         B, T, _ = z.shape
         distances = self._compute_distances(z)
         if training:
+            # Gumbel temperature annealing (read from config if available)
+            tau_hi = getattr(self, 'tau_hi', 2.0)
+            tau_lo = getattr(self, 'tau_lo', 0.5)
+            decay_steps = getattr(self, 'tau_decay_steps', 10000.0)
+            step = self.step_counter.float()
+            current_tau = tau_lo + (tau_hi - tau_lo) * torch.exp(-step / decay_steps)
+
             logits = -distances
-            codes, indices = self._gumbel_softmax_st(logits, self.gumbel_temp)
+            codes, indices = self._gumbel_softmax_st(logits, current_tau.item())
             quantized = torch.einsum('btk,kd->btd', codes, self.codebook)
             hard_indices = indices
             embedding = F.embedding(hard_indices, self.codebook)
@@ -270,7 +406,11 @@ class RVQQuantizer(nn.Module):
             quantized = embedding
             drop_prob = 0.0
         z_q = z + (quantized - z).detach()
-        commitment = F.mse_loss(z_q.detach(), z)
+
+        # Stronger commitment loss to prevent encoder drift
+        commitment = F.mse_loss(z_q.detach(), z) * 0.5  # Increased from implicit 0.25
+
+        # Calculate codebook statistics
         usage_sum = self.codebook_usage.sum()
         if usage_sum > 0:
             usage_prob = self.codebook_usage / (usage_sum + 1e-10)
@@ -278,14 +418,231 @@ class RVQQuantizer(nn.Module):
             usage_prob = torch.full_like(self.codebook_usage, 1.0 / self.K)
         entropy = -(usage_prob * torch.log(usage_prob + 1e-10)).sum()
         perplexity = torch.exp(entropy)
+
+        # Entropy bonus: encourage diverse code usage during training
+        # Only apply in early training (first 20k steps)
+        entropy_bonus = torch.tensor(0.0, device=z.device)
+        if training:
+            step = int(self.step_counter.item())
+            if step < 20000:
+                # Bonus decays from 0.05 to 0 over 20k steps
+                bonus_weight = 0.05 * (1.0 - step / 20000.0)
+                entropy_bonus = -bonus_weight * entropy  # Negative to maximize entropy
+
+        # Track active codes in current batch
+        active_codes = hard_indices.unique().numel() if training else 0
+
         return {
             'z_q': z_q,
             'embedding': embedding,
             'indices': hard_indices,
             'commitment_loss': commitment,
+            'entropy_bonus': entropy_bonus,
             'perplexity': perplexity,
             'usage_entropy': entropy,
             'drop_prob': float(drop_prob),
+            'active_codes': active_codes,
+            'current_tau': current_tau.item() if training else 0.0,
+        }
+
+
+class MultiStageRVQ(nn.Module):
+    """
+    Multi-stage Residual Vector Quantizer with frame-level embedding fusion.
+
+    Key features:
+    - Cascaded RVQ stages: each stage quantizes residual from previous stage
+    - Frame embedding fusion: combines embeddings from all stages into single token per frame
+    - Maintains sequence length: T frames → T tokens (not T×num_stages)
+    - Stage-specific training strategies (commitment, Gumbel τ, dropout)
+
+    Args:
+        num_stages: number of RVQ stages (default 2 for Phase 2)
+        dim: embedding dimension
+        codebook_size: size of each stage's codebook (typically 4096)
+        stage_commitment_weights: commitment loss multiplier per stage [stage1_mult, stage2_mult, ...]
+        stage_tau_configs: Gumbel temperature config per stage [(tau_hi, tau_lo, decay_steps), ...]
+        stage_drop_configs: dropout config per stage [(drop_start, drop_end, decay_steps), ...]
+        fusion_mode: 'weighted_sum' or 'concat_linear'
+    """
+
+    def __init__(
+        self,
+        num_stages=2,
+        dim=256,
+        codebook_size=4096,
+        ema_decay=0.97,
+        awakening_steps=200,
+        stage_commitment_weights=None,  # e.g. [1.25, 0.5] for [stage1, stage2]
+        stage_tau_configs=None,  # e.g. [(2.0, 0.5, 10000), (2.5, 0.5, 20000)]
+        stage_drop_configs=None,  # e.g. [(0.0, 0.0, 0), (0.6, 0.1, 200000)]
+        fusion_mode='weighted_sum',
+    ):
+        super().__init__()
+        self.num_stages = num_stages
+        self.dim = dim
+        self.fusion_mode = fusion_mode
+
+        # Default stage-specific configs if not provided
+        if stage_commitment_weights is None:
+            # Stage 1: stronger commitment (1.25x), Stage 2+: weaker (0.5x)
+            stage_commitment_weights = [1.25] + [0.5] * (num_stages - 1)
+
+        if stage_tau_configs is None:
+            # Stage 1: normal schedule, Stage 2+: longer exploration
+            stage_tau_configs = [(2.0, 0.5, 10000)]  # Stage 1
+            for _ in range(num_stages - 1):
+                stage_tau_configs.append((2.5, 0.5, 20000))  # Stage 2+ (longer decay)
+
+        if stage_drop_configs is None:
+            # Stage 1: no dropout, Stage 2+: apply dropout
+            stage_drop_configs = [(0.0, 0.0, 0)]  # Stage 1 (no dropout)
+            for _ in range(num_stages - 1):
+                stage_drop_configs.append((0.6, 0.1, 200000))  # Stage 2+ (with dropout)
+
+        self.stage_commitment_weights = stage_commitment_weights
+
+        # Create RVQ stages
+        self.quantizers = nn.ModuleList()
+        for stage_idx in range(num_stages):
+            tau_hi, tau_lo, tau_decay = stage_tau_configs[stage_idx]
+            drop_start, drop_end, drop_decay = stage_drop_configs[stage_idx]
+
+            rvq = RVQQuantizer(
+                dim=dim,
+                codebook_size=codebook_size,
+                ema_decay=ema_decay,
+                awakening_steps=awakening_steps,
+                gumbel_temp=1.0,  # will be overridden by tau schedule
+                drop_start=drop_start,
+                drop_end=drop_end,
+                drop_decay_steps=drop_decay,
+            )
+
+            # Attach stage-specific Gumbel τ config
+            rvq.tau_hi = tau_hi
+            rvq.tau_lo = tau_lo
+            rvq.tau_decay_steps = tau_decay
+
+            self.quantizers.append(rvq)
+
+            print(f"[MultiStageRVQ] Stage {stage_idx+1}: commitment={stage_commitment_weights[stage_idx]:.2f}, "
+                  f"τ=({tau_hi:.1f}→{tau_lo:.1f}, {tau_decay}steps), "
+                  f"dropout=({drop_start:.1f}→{drop_end:.1f})")
+
+        # Frame embedding fusion layer
+        if fusion_mode == 'weighted_sum':
+            # Learnable weights for Σ_j W_j·emb_j
+            self.fusion_weights = nn.Parameter(torch.ones(num_stages) / num_stages)
+            self.fusion_proj = None
+        elif fusion_mode == 'concat_linear':
+            # Concat all embeddings then 1×1 linear
+            self.fusion_weights = None
+            self.fusion_proj = nn.Linear(dim * num_stages, dim)
+        else:
+            raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
+
+        print(f"[MultiStageRVQ] {num_stages} stages, fusion={fusion_mode}, codebook={codebook_size}")
+
+    def forward(self, z, training=True):
+        """
+        Args:
+            z: continuous latent [B, T, D]
+            training: whether in training mode
+
+        Returns:
+            dict with keys:
+                - z_q: fused quantized embedding [B, T, D]
+                - embeddings: list of embeddings per stage [[B, T, D], ...]
+                - indices: list of indices per stage [[B, T], ...]
+                - commitment_loss: total weighted commitment loss
+                - (other aggregated metrics)
+        """
+        B, T, D = z.shape
+        device = z.device
+
+        z_residual = z
+        embeddings = []
+        indices = []
+        commitment_losses = []
+
+        # Aggregate metrics
+        perplexities = []
+        entropy_bonuses = []
+        usage_entropies = []
+        total_active_codes = 0
+        total_drop_prob = 0.0
+        total_current_tau = 0.0
+
+        # Cascade through stages
+        for stage_idx, quantizer in enumerate(self.quantizers):
+            out = quantizer(z_residual, training=training)
+
+            emb = out['embedding']  # [B, T, D]
+            idx = out['indices']    # [B, T]
+
+            embeddings.append(emb)
+            indices.append(idx)
+
+            # Apply stage-specific commitment weight
+            stage_commitment = out['commitment_loss'] * self.stage_commitment_weights[stage_idx]
+            commitment_losses.append(stage_commitment)
+
+            # Update residual for next stage: z_res = z_res - emb
+            z_residual = z_residual - emb.detach()  # detach to prevent gradient leakage
+
+            # Aggregate metrics
+            perplexity = out['perplexity']
+            if not isinstance(perplexity, torch.Tensor):
+                perplexity = torch.tensor(perplexity, device=device)
+            perplexities.append(perplexity.detach())
+
+            entropy_bonus = out.get('entropy_bonus', torch.tensor(0.0, device=device))
+            if not isinstance(entropy_bonus, torch.Tensor):
+                entropy_bonus = torch.tensor(entropy_bonus, device=device)
+            entropy_bonuses.append(entropy_bonus.detach())
+
+            usage_entropy = out['usage_entropy']
+            if not isinstance(usage_entropy, torch.Tensor):
+                usage_entropy = torch.tensor(usage_entropy, device=device)
+            usage_entropies.append(usage_entropy.detach())
+            total_active_codes += out.get('active_codes', 0)
+            total_drop_prob += out.get('drop_prob', 0.0)
+            total_current_tau += out.get('current_tau', 0.0)
+
+        # Fuse embeddings (maintains T sequence length)
+        if self.fusion_mode == 'weighted_sum':
+            # Weighted sum: Σ_j W_j·emb_j
+            weights = F.softmax(self.fusion_weights, dim=0)  # normalize
+            z_fused = sum(w * emb for w, emb in zip(weights, embeddings))
+        elif self.fusion_mode == 'concat_linear':
+            # Concat + linear: [emb_1, emb_2, ...] → Linear → [B, T, D]
+            z_concat = torch.cat(embeddings, dim=-1)  # [B, T, D*num_stages]
+            z_fused = self.fusion_proj(z_concat)  # [B, T, D]
+
+        # Straight-through estimator: stop gradient on quantized, keep gradient on input
+        z_q = z + (z_fused - z).detach()
+
+        # Total commitment loss
+        commitment_loss = sum(commitment_losses) / len(commitment_losses)
+
+        mean_perplexity = torch.stack(perplexities).mean() if perplexities else torch.tensor(0.0, device=device)
+        mean_entropy_bonus = torch.stack(entropy_bonuses).mean() if entropy_bonuses else torch.tensor(0.0, device=device)
+        mean_usage_entropy = torch.stack(usage_entropies).mean() if usage_entropies else torch.tensor(0.0, device=device)
+
+        return {
+            'z_q': z_q,
+            'embedding': z_fused,  # fused embedding for compatibility
+            'embeddings': embeddings,  # list of per-stage embeddings
+            'indices': indices,  # list of per-stage indices [B, T] × num_stages
+            'commitment_loss': commitment_loss,
+            'entropy_bonus': mean_entropy_bonus,
+            'perplexity': mean_perplexity,
+            'usage_entropy': mean_usage_entropy,
+            'drop_prob': total_drop_prob / self.num_stages,
+            'active_codes': total_active_codes / self.num_stages,
+            'current_tau': total_current_tau / self.num_stages,
+            'num_stages': self.num_stages,
         }
 
 

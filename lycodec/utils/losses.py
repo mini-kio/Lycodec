@@ -1,33 +1,28 @@
 import torch
 import torch.nn.functional as F
 import math
-from lycodec.utils.common import safe_loss_device, validate_tensors
 
-def stft_loss(x, y, cfg):
-    """Multi-resolution STFT loss for batched multichannel audio."""
-    is_batched = x.ndim == 3
-    if is_batched:
-        b, c, t = x.shape
-        x_flat = x.reshape(b * c, t)
-        y_flat = y.reshape(b * c, t)
-    else:
-        x_flat = x
-        y_flat = y
 
-    x32 = x_flat.float()
-    y32 = y_flat.float()
+# ============================================================================
+# Utility Functions
+# ============================================================================
 
-    losses = []
-    for hl, wl in zip([128, 256, 512, 1024], [512, 1024, 2048, 4096]):
-        win = torch.hann_window(wl, device=x.device, dtype=torch.float32)
-        X = torch.stft(x32, n_fft=wl, hop_length=hl, win_length=wl, window=win, return_complex=True)
-        Y = torch.stft(y32, n_fft=wl, hop_length=hl, win_length=wl, window=win, return_complex=True)
-        losses.append((X.abs() - Y.abs()).abs().mean())
-        phase_diff = torch.angle(X) - torch.angle(Y)
-        phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
-        losses.append(phase_diff.abs().mean())
-    return sum(losses)
+def safe_loss_device(*tensors):
+    """Extract device from first valid tensor, otherwise return 'cpu'."""
+    for t in tensors:
+        if isinstance(t, torch.Tensor):
+            return t.device
+    return 'cpu'
 
+
+def validate_tensors(*tensors):
+    """Check if all arguments are valid tensors."""
+    return all(isinstance(t, torch.Tensor) for t in tensors)
+
+
+# ============================================================================
+# Loss Functions
+# ============================================================================
 
 def sample_noise_levels(batch_size, device, sigma_min=0.002, sigma_max=80.0, rho=7.0):
     """Sample noise levels from log-normal distribution (EDM schedule)."""
@@ -61,8 +56,17 @@ def decode_microbatched(model, tokens, length, sigma, spec_noisy, chunk=2):
         outs.append(model.decode(tokens[i:i+chunk], length, sigma[i:i+chunk], spec_noisy[i:i+chunk]))
     return torch.cat(outs, dim=0)
 
-def consistency_loss(model, wav, tokens, spec_clean, sigma_min=0.002, sigma_max=80.0, rho=7.0, ema_model=None):
-    """Consistency Distillation Loss for one-step generation."""
+def consistency_loss(model, wav, tokens, spec_clean, sigma_min=0.002, sigma_max=80.0, rho=7.0, ema_model=None, decode_chunk=1, teacher_fn=None, return_student_pred=False):
+    """
+    Consistency Distillation Loss for one-step generation.
+
+    MEMORY OPTIMIZATION: Teacher prediction is computed FIRST (no_grad) to reduce peak memory.
+
+    Args:
+        decode_chunk: microbatch size for decode (default=1 for lowest memory)
+        teacher_fn: optional custom teacher decode function for CPU-based EMA
+        return_student_pred: if True, return (loss, student_prediction) for reuse
+    """
     b = spec_clean.shape[0]
     device = spec_clean.device
     length = wav.shape[-1]
@@ -75,37 +79,27 @@ def consistency_loss(model, wav, tokens, spec_clean, sigma_min=0.002, sigma_max=
     spec_noisy_i = spec_clean + sigma_i.view(b, 1, 1, 1) * noise
     spec_noisy_i_plus = spec_clean + sigma_i_plus.view(b, 1, 1, 1) * noise
 
-    pred_i_plus = decode_microbatched(model, tokens, length, sigma_i_plus, spec_noisy_i_plus, chunk=2)
-
-    teacher = ema_model if ema_model is not None else model
+    # 1) Teacher FIRST (no_grad, memory-efficient)
     with torch.no_grad():
-        pred_i = decode_microbatched(teacher, tokens, length, sigma_i, spec_noisy_i, chunk=2)
+        if teacher_fn is not None:
+            pred_i = teacher_fn(tokens, length, sigma_i, spec_noisy_i, chunk=decode_chunk)
+        else:
+            teacher = ema_model if ema_model is not None else model
+            pred_i = decode_microbatched(teacher, tokens, length, sigma_i, spec_noisy_i, chunk=decode_chunk)
+
+    # 2) Student AFTER (grad enabled)
+    pred_i_plus = decode_microbatched(model, tokens, length, sigma_i_plus, spec_noisy_i_plus, chunk=decode_chunk)
 
     spec_size = spec_clean.shape[2] * spec_clean.shape[3]
     c = 0.00054 * math.sqrt(spec_size)
     loss = pseudo_huber_loss(pred_i_plus, pred_i, c=c)
     loss = loss / (delta_sigma.mean() + 1e-8)
 
+    # OPTIMIZATION: Return student prediction for reuse (stereo loss, metrics, etc.)
+    if return_student_pred:
+        return loss, pred_i_plus.detach()  # detach to avoid holding computation graph
     return loss
 
-def commitment_loss(z_cont, z_disc):
-    """VQ-VAE commitment loss: encourage encoder to commit to codes."""
-    if z_disc is None:
-        return torch.tensor(0.0, device=z_cont.device)
-    return F.mse_loss(z_cont, z_disc.detach())
-
-def rvq_perplexity_loss(perplexity, target_perplexity=2048):
-    """Encourage RVQ codebook usage to reach target perplexity."""
-    if perplexity >= target_perplexity:
-        return torch.tensor(0.0, device=perplexity.device)
-    gap = target_perplexity - perplexity
-    return (gap / target_perplexity) ** 2
-
-def infill_loss(rec_wav, target_wav, cfg, decoder_used_continuous=False):
-    """STFT infill loss; skipped when decoder saw continuous latents."""
-    if decoder_used_continuous:
-        return torch.zeros((), device=rec_wav.device)
-    return stft_loss(rec_wav, target_wav, cfg)
 
 def residual_loss(r_hat, r_target):
     """MSE between predicted residuals and targets."""
@@ -125,33 +119,64 @@ def alignment_loss(y_disc, y_cont_detached):
     y_cont_norm = F.normalize(y_cont_detached, dim=-1)
     return 1 - (y_disc_norm * y_cont_norm).sum(dim=-1).mean()
 
+def stereo_corr_loss(target, pred):
+    """
+    Stereo correlation loss to preserve stereo field characteristics.
+
+    Args:
+        target: target waveform [B, 2, T]
+        pred: predicted waveform [B, 2, T]
+
+    Returns:
+        absolute difference in correlation between L/R channels
+    """
+    def compute_corr(x):
+        """Compute correlation between left and right channels."""
+        if x.shape[1] != 2:
+            return torch.tensor(0.0, device=x.device)
+        l, r = x[:, 0], x[:, 1]  # [B, T]
+        # Center
+        l = l - l.mean(dim=-1, keepdim=True)
+        r = r - r.mean(dim=-1, keepdim=True)
+        # Correlation
+        num = (l * r).sum(dim=-1)
+        den = (l.pow(2).sum(dim=-1) * r.pow(2).sum(dim=-1)).sqrt() + 1e-8
+        return (num / den).mean()
+
+    corr_target = compute_corr(target)
+    corr_pred = compute_corr(pred)
+    return (corr_target - corr_pred).abs()
+
 def summary_contrast_loss(summary_a, summary_b, temperature=0.07, gather_fn=None):
     """
     InfoNCE contrastive loss with distributed support.
 
+    FIXED: Gather is now wrapped in no_grad() to prevent autograd warnings.
+
     Args:
-        summary_a: positive features [B, D]
-        summary_b: negative features [B, D]
+        summary_a: query features [B, D] (gradients flow)
+        summary_b: key features [B, D] (target, detached)
         temperature: softmax temperature
         gather_fn: optional function to gather features across GPUs (e.g., accelerator.gather)
     """
     if summary_a is None or summary_b is None:
         return torch.zeros((), device=summary_a.device if summary_a is not None else summary_b.device)
 
-    # Extra safety: ensure target (summary_b) is completely detached
+    # Detach target completely
     summary_b = summary_b.detach()
     summary_a = F.normalize(summary_a, dim=-1)
     summary_b = F.normalize(summary_b, dim=-1)
 
-    # Gather features from all GPUs if distributed
+    # Gather features from all GPUs if distributed (NO GRAD on gather)
     if gather_fn is not None:
         try:
-            summary_a_all = gather_fn(summary_a)
-            summary_b_all = gather_fn(summary_b)
-            # Use global features for both
-            logits = summary_a_all @ summary_b_all.t() / temperature
-            # Labels are diagonal indices for the full global batch
-            labels = torch.arange(summary_a_all.size(0), device=summary_a.device)
+            with torch.no_grad():
+                # Gather keys only (no gradient through all_gather)
+                summary_b_all = gather_fn(summary_b)
+            # Use local query, global keys
+            logits = summary_a @ summary_b_all.t() / temperature
+            # Labels: local batch indices (assumes same batch size across ranks)
+            labels = torch.arange(summary_a.size(0), device=summary_a.device)
         except:
             # Fallback to local batch if gathering fails
             logits = summary_a @ summary_b.t() / temperature
@@ -160,6 +185,5 @@ def summary_contrast_loss(summary_a, summary_b, temperature=0.07, gather_fn=None
         logits = summary_a @ summary_b.t() / temperature
         labels = torch.arange(summary_a.size(0), device=summary_a.device)
 
-    loss_ab = F.cross_entropy(logits, labels)
-    loss_ba = F.cross_entropy(logits.t(), labels)
-    return 0.5 * (loss_ab + loss_ba)
+    loss = F.cross_entropy(logits, labels)
+    return loss

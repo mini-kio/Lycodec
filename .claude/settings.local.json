@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile:*)",
+      "Bash(python test_imports.py:*)",
+      "Bash(del test_imports.py)",
+      "Bash(python test_final.py:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

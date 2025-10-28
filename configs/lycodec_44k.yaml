@@ -1,0 +1,112 @@
+sample_rate: 44100
+stft:
+  n_fft: 2048
+  hop_length: 588
+  win_length: 2048
+crop_seconds: 1.5
+chunk_seconds: 1.5
+hop_seconds: 0.75
+batch_size: 4
+epochs: 2000
+lr: 0.00005
+device: cuda
+num_workers: 12
+save_every: 1000
+
+# ===== Model Configuration (≈131M params) =====
+model:
+  hidden_dim: 512
+  token_dim: 256
+  transformer_layers: 8
+  heads: 8
+  use_rope: true
+  token_fps: 24  # Tokens per second (24 fps × 1.5 sec crop = 36 tokens per clip)
+
+  # Multi-stage RVQ: 2×4096 codebook → 24 bits/frame × 24 fps ≈ 0.576 kbps
+  use_multi_stage_rvq: true
+  rvq_num_stages: 2
+  rvq_codebook_size: 4096
+  rvq_ema_decay: 0.995
+  rvq_awakening_steps: 50
+  rvq_fusion_mode: weighted_sum  # weighted_sum | concat_linear
+
+  # Stage-specific configs
+  rvq_stage_commitment_weights: [1.25, 0.5]  # Stage 1: high (stability), Stage 2: low (refinement)
+  rvq_stage_tau_configs:  # [tau_hi, tau_lo, decay_steps]
+    - [2.0, 0.5, 10000]   # Stage 1: normal schedule
+    - [2.5, 0.5, 20000]   # Stage 2: longer exploration
+  rvq_stage_drop_configs:  # [drop_start, drop_end, decay_steps]
+    - [0.0, 0.0, 0]        # Stage 1: no dropout
+    - [0.6, 0.1, 200000]   # Stage 2: dropout for diversity
+
+  # Single-stage RVQ (fallback when use_multi_stage_rvq=false)
+  rvq_drop_start: 0.6
+  rvq_drop_end: 0.1
+  rvq_drop_decay_steps: 100000
+
+  use_residual_corrector: true
+  corrector_alpha: 0.3
+
+  # Decoder (optimized for 16GB VRAM)
+  decoder_depth: 4
+  decoder_patch_size: 32
+  decoder_embed_dim: 384
+  decoder_mlp_ratio: 2.5
+  decoder_cond_ch: 32
+
+train:
+  grad_clip: 1.0
+  use_amp: true
+  gradient_accumulation_steps: 4
+  use_checkpoint: true
+
+  # RVQ warmup and temperature (single-stage only, multi-stage uses stage_tau_configs)
+  rvq_warmup_steps: 1000
+  gumbel_tau_hi: 3.0
+  gumbel_tau_lo: 0.5
+  gumbel_tau_decay_steps: 20000
+
+  # Loss weight schedules [step, weight]
+  residual_weight_schedule:
+    - [0, 0.0]
+    - [5000, 0.1]
+    - [20000, 0.3]
+    - [30000, 0.5]
+
+  alignment_weight_schedule:
+    - [0, 0.0]
+    - [20000, 0.01]
+
+  contrast_weight_schedule:
+    - [0, 0.0]
+    - [10000, 0.01]
+    - [30000, 0.02]
+
+  stereo_corr_weight_schedule:
+    - [0, 0.0]
+    - [30000, 0.02]
+
+  # Consistency model
+  sigma_min: 0.002
+  sigma_max: 80.0
+  rho: 7.0
+  use_ema_teacher: true
+  decode_chunk: 2
+
+  ema:
+    enabled: true
+    decay: 0.995
+
+data:
+  wav_exts: [".wav", ".flac", ".mp3"]
+  segment_seconds: 1.5
+  stereo: true
+
+output:
+  ckpt_dir: runs/ckpts
+  log_dir: runs/logs
+
+logging:
+  use_wandb: true
+  project: lycodec
+  run_name: lycodec_44k

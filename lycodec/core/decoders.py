@@ -3,8 +3,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from lycodec.utils.audio import resample_time
-from lycodec.utils.common import compute_noise_embedding, to_tensor
-from lycodec.core.common_blocks import ConvNormAct2d, ConvTransposeNormAct2d
+from lycodec.core.blocks import ConvNormAct2d, ConvTransposeNormAct2d
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def to_tensor(value, batch_size=None, device='cpu', dtype=torch.float32):
+    """Convert value to tensor if not already a tensor."""
+    if not torch.is_tensor(value):
+        if batch_size is not None:
+            value = [value] * batch_size
+        else:
+            value = [value]
+        return torch.tensor(value, device=device, dtype=dtype)
+    return value
+
+
+def compute_noise_embedding(sigma, reshape=True):
+    """Compute noise embedding from sigma values."""
+    if not torch.is_tensor(sigma):
+        sigma = torch.tensor([sigma], dtype=torch.float32)
+    c_noise = 0.25 * torch.log(sigma)
+    if reshape:
+        c_noise = c_noise.view(-1, 1)
+    else:
+        c_noise = c_noise.squeeze()
+    return c_noise
 
 
 def edm_parameterization(sigma, sigma_data=0.5):
@@ -279,8 +305,14 @@ class PatchEmbed(nn.Module):
         Returns:
             patch embeddings [B, N_patches, embed_dim]
             grid_size: (num_patches_h, num_patches_w)
+            orig_size: (H, W) prior to padding
         """
         B, C, H, W = x.shape
+        orig_size = (H, W)
+        pad_h = (self.patch_size - (H % self.patch_size)) % self.patch_size
+        pad_w = (self.patch_size - (W % self.patch_size)) % self.patch_size
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
         x = self.proj(x)  # [B, embed_dim, H/patch_size, W/patch_size]
 
         # Get grid size before flattening
@@ -290,7 +322,7 @@ class PatchEmbed(nn.Module):
         x = x.flatten(2)  # [B, embed_dim, N_patches]
         x = x.transpose(1, 2)  # [B, N_patches, embed_dim]
 
-        return x, (grid_h, grid_w)
+        return x, (grid_h, grid_w), orig_size
 
 
 class Unpatchify(nn.Module):
@@ -331,11 +363,12 @@ class Unpatchify(nn.Module):
         # Final projection to output channels
         self.final_proj = nn.Conv2d(32, c_out, kernel_size=3, padding=1)
 
-    def forward(self, x, grid_size):
+    def forward(self, x, grid_size, orig_size=None):
         """
         Args:
             x: patch embeddings [B, N_patches, embed_dim]
             grid_size: (grid_h, grid_w) from patch embedding
+            orig_size: (H, W) prior to padding
 
         Returns:
             reconstructed spectrogram [B, c_out, H, W]
@@ -350,12 +383,16 @@ class Unpatchify(nn.Module):
         # Upsample
         x = self.upsample(x)
 
+        # Final projection
+        x = self.final_proj(x)
+
+        if orig_size is not None:
+            H, W = orig_size
+            x = x[..., :H, :W]
+
         # Interpolate to exact target size if needed
         if x.shape[2:] != self.target_size:
             x = F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
-
-        # Final projection
-        x = self.final_proj(x)
 
         return x
 
@@ -421,8 +458,8 @@ class TransformerDecoder2D(nn.Module):
         self.patch_embed = PatchEmbed(c_in, patch_size, embed_dim)
 
         # Calculate number of patches for positional encoding
-        grid_h = target_size[0] // patch_size
-        grid_w = target_size[1] // patch_size
+        grid_h = math.ceil(target_size[0] / patch_size)
+        grid_w = math.ceil(target_size[1] / patch_size)
         num_patches = grid_h * grid_w
 
         # Learnable positional encoding for patches
@@ -494,10 +531,11 @@ class TransformerDecoder2D(nn.Module):
         x_cat = torch.cat([x, cond], dim=1)  # [B, 68, F, T]
 
         # Patch embedding
-        x_patches, grid_size = self.patch_embed(x_cat)  # [B, N_patches, embed_dim]
+        x_patches, grid_size, orig_size = self.patch_embed(x_cat)  # [B, N_patches, embed_dim]
 
         # Add positional encoding to patches
-        x_patches = x_patches + self.pos_embed
+        pos = self.pos_embed[:, :x_patches.shape[1], :]
+        x_patches = x_patches + pos
 
         # Prepare token conditioning
         if tokens is not None:
@@ -518,6 +556,6 @@ class TransformerDecoder2D(nn.Module):
         x_patches = self.final_ln(x_patches)
 
         # Unpatchify to reconstruct spectrogram
-        output = self.unpatchify(x_patches, grid_size)  # [B, 4, F, T]
+        output = self.unpatchify(x_patches, grid_size, orig_size)  # [B, 4, F, T]
 
         return output

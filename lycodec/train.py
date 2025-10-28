@@ -10,21 +10,85 @@ from accelerate import Accelerator
 from lycodec.data import StereoCropDataset
 from lycodec.model import Lycodec
 from lycodec.utils.losses import (
-    stft_loss,
     consistency_loss,
-    rvq_perplexity_loss,
-    infill_loss,
     residual_loss,
     alignment_loss,
     summary_contrast_loss,
+    stereo_corr_loss,
 )
 from lycodec.utils.audio import stereo_metrics_inline
-from lycodec.utils.model_utils import build_model_from_config
 
 
 def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def build_model_from_config(cfg):
+    """Build Lycodec model from configuration dictionary."""
+
+    # Parse multi-stage RVQ configs
+    use_multi_stage = cfg["model"].get("use_multi_stage_rvq", False)
+    rvq_num_stages = cfg["model"].get("rvq_num_stages", 2)
+
+    # Stage-specific configs (if provided in YAML)
+    stage_commitment_weights = cfg["model"].get("rvq_stage_commitment_weights", None)
+    stage_tau_configs = cfg["model"].get("rvq_stage_tau_configs", None)
+    stage_drop_configs = cfg["model"].get("rvq_stage_drop_configs", None)
+
+    # Calculate token_fps: tokens per second (Hz)
+    # NOTE: Model internally uses this as sequence length for training clips
+    # e.g., 24 Hz * 1.5s = 36 tokens/clip, but we still call it "fps" (frequency)
+    token_fps_hz = cfg["model"].get("token_fps", 24)  # tokens per second (Hz)
+    crop_seconds = cfg.get("crop_seconds", 1.5)
+    tokens_per_clip = int(token_fps_hz * crop_seconds)  # e.g., 24 * 1.5 = 36
+
+    model = Lycodec(
+        sr=cfg["sample_rate"],
+        n_fft=cfg["stft"]["n_fft"],
+        hop=cfg["stft"]["hop_length"],
+        win=cfg["stft"]["win_length"],
+        token_dim=cfg["model"]["token_dim"],
+        hidden=cfg["model"]["hidden_dim"],
+        layers=cfg["model"]["transformer_layers"],
+        heads=cfg["model"]["heads"],
+        use_checkpoint=cfg["train"].get("use_checkpoint", False),
+        use_rope=cfg["model"].get("use_rope", True),
+        decoder_depth=cfg["model"].get("decoder_depth", 6),
+        decoder_patch_size=cfg["model"].get("decoder_patch_size", 16),
+        decoder_embed_dim=cfg["model"].get("decoder_embed_dim", 512),
+        decoder_mlp_ratio=cfg["model"].get("decoder_mlp_ratio", 4.0),
+        decoder_cond_ch=cfg["model"].get("decoder_cond_ch", 64),
+        rvq_codebook_size=cfg["model"].get("rvq_codebook_size", 4096),
+        rvq_ema_decay=cfg["model"].get("rvq_ema_decay", 0.97),
+        rvq_awakening_steps=cfg["model"].get("rvq_awakening_steps", 200),
+        token_fps=tokens_per_clip,  # tokens per second (frequency), passed as clip length
+        rvq_drop_start=cfg["model"].get("rvq_drop_start", 0.6),
+        rvq_drop_end=cfg["model"].get("rvq_drop_end", 0.1),
+        rvq_drop_decay_steps=cfg["model"].get("rvq_drop_decay_steps", 200000),
+        use_residual_corrector=cfg["model"].get("use_residual_corrector", True),
+        corrector_alpha=cfg["model"].get("corrector_alpha", 0.3),
+        # Multi-stage RVQ (Phase 2)
+        use_multi_stage_rvq=use_multi_stage,
+        rvq_num_stages=rvq_num_stages,
+        rvq_stage_commitment_weights=stage_commitment_weights,
+        rvq_stage_tau_configs=stage_tau_configs,
+        rvq_stage_drop_configs=stage_drop_configs,
+        rvq_fusion_mode=cfg["model"].get("rvq_fusion_mode", "weighted_sum"),
+    )
+
+    # Set training-specific parameters (not part of model architecture)
+    model.rvq_warmup_steps = cfg["train"].get("rvq_warmup_steps", 5000)
+
+    # Set Gumbel temperature annealing parameters on RVQ
+    # For multi-stage, these are already set in MultiStageRVQ constructor via stage_tau_configs
+    # For single-stage, set them here
+    if not use_multi_stage:
+        model.rvq.tau_hi = cfg["train"].get("gumbel_tau_hi", 2.0)
+        model.rvq.tau_lo = cfg["train"].get("gumbel_tau_lo", 0.5)
+        model.rvq.tau_decay_steps = cfg["train"].get("gumbel_tau_decay_steps", 10000)
+
+    return model
 
 
 def save_ckpt(state, path):
@@ -67,9 +131,11 @@ def train(cfg_path, data_root):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    grad_clip = cfg["train"].get("grad_clip", 1.0)
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.get("train", {}).get("gradient_accumulation_steps", 1),
-        mixed_precision="fp16" if cfg.get("train", {}).get("use_amp", False) else "no"
+        mixed_precision="fp16" if cfg.get("train", {}).get("use_amp", False) else "no",
+        # Gradient clipping handled by Accelerator when using accumulate()
     )
     sr = cfg["sample_rate"]
     crop_s = cfg["crop_seconds"]
@@ -84,7 +150,7 @@ def train(cfg_path, data_root):
         drop_last=True,
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     model = build_model_from_config(cfg)
@@ -106,7 +172,14 @@ def train(cfg_path, data_root):
     ], lr=cfg["lr"])
     model, opt, dl = accelerator.prepare(model, opt, dl)
 
-    grad_clip = cfg["train"]["grad_clip"]
+    # Verify sample rate consistency between dataset and model
+    if accelerator.is_main_process:
+        dataset_sr = cfg["sample_rate"]
+        model_sr = accelerator.unwrap_model(model).sr
+        model_hop = accelerator.unwrap_model(model).hop
+        print(f"[Config Check] dataset_sr={dataset_sr}, model_sr={model_sr}, model_hop={model_hop}")
+        assert model_sr == dataset_sr, f"SR mismatch: dataset={dataset_sr} vs model={model_sr}"
+
     total_steps = 0
     ema = EMA(accelerator.unwrap_model(model), decay=cfg["train"]["ema"].get("decay", 0.9999)) if cfg["train"]["ema"].get("enabled", False) else None
 
@@ -117,69 +190,141 @@ def train(cfg_path, data_root):
         except Exception as e:
             print(f"wandb init failed: {e}")
 
+    def get_scheduled_weight(schedule, current_step):
+        """Get weight from schedule based on current step (with linear interpolation)."""
+        if not schedule:
+            return 0.0
+        # Find the two points to interpolate between
+        prev_step, prev_weight = 0, 0.0
+        for step_thr, w in schedule:
+            if current_step >= step_thr:
+                prev_step, prev_weight = step_thr, float(w)
+            else:
+                # Linear interpolation
+                if prev_step < current_step < step_thr:
+                    ratio = (current_step - prev_step) / (step_thr - prev_step)
+                    return prev_weight + ratio * (float(w) - prev_weight)
+                break
+        return prev_weight
+
     for epoch in range(cfg["epochs"]):
         model.train()
         pbar = tqdm(dl, desc=f"epoch {epoch}")
         for wav in pbar:
-            stft_weight = 0.0
-            stft_sched = cfg["train"].get("stft_weight_schedule", [])
-            for step_thr, w in stft_sched[::-1]:
-                if total_steps >= step_thr:
-                    stft_weight = float(w)
-                    break
+            # Calculate scheduled weights
+            alignment_weight = get_scheduled_weight(cfg["train"].get("alignment_weight_schedule", []), total_steps)
+            contrast_weight = get_scheduled_weight(cfg["train"].get("contrast_weight_schedule", []), total_steps)
+            stereo_corr_weight = get_scheduled_weight(cfg["train"].get("stereo_corr_weight_schedule", []), total_steps)
+            residual_weight = get_scheduled_weight(cfg["train"].get("residual_weight_schedule", []), total_steps)
 
             with accelerator.accumulate(model):
-                rec, enc = model(wav, decode=True)
                 model_obj = accelerator.unwrap_model(model)
+
+                # MEMORY OPTIMIZATION: decode=False to skip unnecessary reconstruction
+                with accelerator.autocast():
+                    rec = None
+                    _, enc = model(wav, decode=False)
+
                 loss = torch.zeros((), device=accelerator.device)
 
-                # Consistency loss with EMA teacher
-                ema_teacher = None
-                if ema is not None:
-                    ema_teacher = copy.deepcopy(model_obj)
-                    ema_teacher.eval()
-                    ema.copy_to(ema_teacher)
+                # MEMORY OPTIMIZATION: EMA teacher on CPU, only move to GPU per microbatch
+                ema_teacher_cpu = None
+                teacher_fn = None
+                use_ema_teacher = cfg["train"].get("use_ema_teacher", True)
+                if use_ema_teacher and ema is not None:
+                    import copy
+                    # Keep EMA teacher on CPU to save GPU memory
+                    ema_teacher_cpu = copy.deepcopy(model_obj).cpu()
+                    ema.copy_to(ema_teacher_cpu)
+                    ema_teacher_cpu.eval()
 
-                loss_consistency = consistency_loss(
-                    model_obj, wav, enc["tokens"], enc["spec_clean"],
-                    sigma_min=cfg["train"].get("sigma_min", 0.002),
-                    sigma_max=cfg["train"].get("sigma_max", 80.0),
-                    rho=cfg["train"].get("rho", 7.0),
-                    ema_model=ema_teacher,
-                )
+                    # Custom teacher function: move to GPU only for microbatch decode
+                    def teacher_decode_fn(tokens, length, sigma, spec_noisy, chunk=1):
+                        outs = []
+                        for i in range(0, tokens.size(0), chunk):
+                            # Move teacher to GPU temporarily
+                            ema_teacher_gpu = ema_teacher_cpu.to(accelerator.device, non_blocking=True)
+                            with torch.no_grad():
+                                outs.append(
+                                    ema_teacher_gpu.decode(
+                                        tokens[i:i+chunk], length,
+                                        sigma[i:i+chunk], spec_noisy[i:i+chunk]
+                                    )
+                                )
+                            # Clean up immediately
+                            del ema_teacher_gpu
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        return torch.cat(outs, dim=0)
+
+                    teacher_fn = teacher_decode_fn
+
+                # OPTIMIZATION: Request student prediction for reuse (saves 1 decode = ~20-30% peak memory)
+                rec = None
+                with accelerator.autocast():
+                    if stereo_corr_weight > 0:
+                        # Reuse student prediction from consistency_loss
+                        loss_consistency, rec = consistency_loss(
+                            model_obj, wav, enc["tokens"], enc["spec_clean"],
+                            sigma_min=cfg["train"].get("sigma_min", 0.002),
+                            sigma_max=cfg["train"].get("sigma_max", 80.0),
+                            rho=cfg["train"].get("rho", 7.0),
+                            ema_model=None,  # Not used when teacher_fn is provided
+                            decode_chunk=cfg["train"].get("decode_chunk", 1),
+                            teacher_fn=teacher_fn,
+                            return_student_pred=True,  # OPTIMIZATION: return student for reuse
+                        )
+                    else:
+                        loss_consistency = consistency_loss(
+                            model_obj, wav, enc["tokens"], enc["spec_clean"],
+                            sigma_min=cfg["train"].get("sigma_min", 0.002),
+                            sigma_max=cfg["train"].get("sigma_max", 80.0),
+                            rho=cfg["train"].get("rho", 7.0),
+                            ema_model=None,
+                            decode_chunk=cfg["train"].get("decode_chunk", 1),
+                            teacher_fn=teacher_fn,
+                        )
+
+                # Clean up EMA teacher CPU copy
+                if ema_teacher_cpu is not None:
+                    del ema_teacher_cpu
                 loss = loss + loss_consistency
 
-                # STFT reconstruction loss
-                if rec is not None and stft_weight > 0:
-                    loss_stft = stft_loss(rec, wav, cfg)
-                    loss = loss + stft_weight * loss_stft
+                # Stereo correlation loss (OPTIMIZATION: reuse student prediction, no extra decode!)
+                loss_stereo_corr = None
+                if stereo_corr_weight > 0 and rec is not None:
+                    loss_stereo_corr = stereo_corr_loss(wav, rec)
+                    loss = loss + stereo_corr_weight * loss_stereo_corr
 
                 # RVQ losses
+                loss_entropy_bonus = None
+
+                # Commitment loss (increased weight for stability)
                 if "commitment_loss" in enc:
-                    loss = loss + 0.25 * enc["commitment_loss"]
-                if "perplexity" in enc:
-                    target_ppx = cfg["train"].get("target_perplexity", 2048)
-                    loss_ppx = rvq_perplexity_loss(enc["perplexity"], target_perplexity=target_ppx)
-                    loss = loss + 0.001 * loss_ppx
-                if rec is not None and not enc.get("dropout_applied", False):
-                    infill_weight = cfg["train"].get("infill_weight", 0.3)
-                    loss_infill = infill_loss(rec, wav, cfg, decoder_used_continuous=enc.get("dropout_applied", False))
-                    loss = loss + infill_weight * loss_infill
+                    loss = loss + enc["commitment_loss"]  # Already weighted inside RVQ (0.5)
 
-                # Corrector losses
+                # Entropy bonus (only in early training, computed in RVQ forward)
+                if "entropy_bonus" in enc:
+                    loss_entropy_bonus = enc["entropy_bonus"]
+                    loss = loss + loss_entropy_bonus
+
+                # Residual loss (scheduled activation, only when not using dropout)
+                loss_residual = None
+                loss_align = None
                 if hasattr(model_obj, 'corrector') and model_obj.corrector is not None:
-                    if enc.get("r_target") is not None and enc.get("r_hat") is not None:
-                        residual_weight = cfg["train"].get("residual_weight", 1.0)
-                        loss_residual = residual_loss(enc["r_hat"], enc["r_target"])
-                        loss = loss + residual_weight * loss_residual
-                    if enc.get("alignment_target") is not None and enc.get("y_disc") is not None:
-                        align_weight = cfg["train"].get("alignment_weight", 0.1)
-                        loss_align = alignment_loss(enc["y_disc"], enc["alignment_target"])
-                        loss = loss + align_weight * loss_align
+                    if residual_weight > 0 and not enc.get("dropout_applied", False):
+                        if enc.get("r_target") is not None and enc.get("r_hat") is not None:
+                            loss_residual = residual_loss(enc["r_hat"], enc["r_target"])
+                            loss = loss + residual_weight * loss_residual
 
-                # Contrast loss (with distributed support)
-                if enc.get("summary_disc") is not None and enc.get("summary_cont") is not None:
-                    contrast_weight = cfg["train"].get("contrast_weight", 1.0)
+                # Alignment loss (scheduled activation for discrete/continuous alignment)
+                if alignment_weight > 0 and enc.get("alignment_target") is not None and enc.get("y_disc") is not None:
+                    loss_align = alignment_loss(enc["y_disc"], enc["alignment_target"])
+                    loss = loss + alignment_weight * loss_align
+
+                # Contrast loss (scheduled activation for semantic representations)
+                loss_contrast = None
+                if contrast_weight > 0 and enc.get("summary_disc") is not None and enc.get("summary_cont") is not None:
                     # Pass accelerator.gather for multi-GPU negative mining
                     gather_fn = accelerator.gather if accelerator.num_processes > 1 else None
                     loss_contrast = summary_contrast_loss(
@@ -189,8 +334,11 @@ def train(cfg_path, data_root):
                     loss = loss + contrast_weight * loss_contrast
 
                 accelerator.backward(loss)
-                if grad_clip:
-                    accelerator.clip_grad_norm_(model.parameters(), grad_clip)
+                # Gradient clipping using torch directly (not accelerator.clip_grad_norm_)
+                # to avoid conflicts with gradient accumulation context
+                if grad_clip and accelerator.sync_gradients:
+                    # Only clip when we're about to update (not during accumulation)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 opt.step()
                 opt.zero_grad()
 
@@ -198,28 +346,76 @@ def train(cfg_path, data_root):
                     ema.update(accelerator.unwrap_model(model))
                 total_steps += 1
 
-            # Clean up references for better memory management
-            del enc, rec, ema_teacher
-            pbar.set_postfix({"loss": float(loss.item())})
+            # Enhanced wandb logging with detailed metrics (log every step from step 0)
+            if cfg["logging"]["use_wandb"] and accelerator.is_main_process:
+                try:
+                    import wandb
+                    log = {
+                        "train/loss_total": float(loss.item()),
+                        "train/loss_consistency": float(loss_consistency.item()),
+                        "train/alignment_weight": alignment_weight,
+                        "train/contrast_weight": contrast_weight,
+                        "train/stereo_corr_weight": stereo_corr_weight,
+                        "train/residual_weight": residual_weight,
+                        "step": total_steps,
+                    }
 
+                    # Individual losses
+                    if loss_stereo_corr is not None:
+                        log["train/loss_stereo_corr"] = float(loss_stereo_corr.item())
+                    if loss_align is not None:
+                        log["train/loss_align"] = float(loss_align.item())
+                    if loss_contrast is not None:
+                        log["train/loss_contrast"] = float(loss_contrast.item())
+                    if loss_residual is not None:
+                        log["train/loss_residual"] = float(loss_residual.item())
+
+                    # RVQ metrics
+                    if "commitment_loss" in enc:
+                        log["rvq/commitment_loss"] = float(enc["commitment_loss"].item())
+                    if "entropy_bonus" in enc and enc["entropy_bonus"].item() != 0:
+                        log["rvq/entropy_bonus"] = float(enc["entropy_bonus"].item())
+                    if "perplexity" in enc:
+                        log["rvq/perplexity"] = float(enc["perplexity"])
+                    if "usage_entropy" in enc:
+                        log["rvq/usage_entropy"] = float(enc["usage_entropy"])
+                    if "drop_prob" in enc:
+                        log["rvq/drop_prob"] = float(enc["drop_prob"])
+                    if "dropout_applied" in enc:
+                        log["rvq/dropout_applied"] = int(enc["dropout_applied"])
+                    if "active_codes" in enc:
+                        log["rvq/active_codes"] = int(enc["active_codes"])
+                    if "current_tau" in enc:
+                        log["rvq/current_tau"] = float(enc["current_tau"])
+
+                    # Corrector losses
+                    if loss_residual is not None:
+                        log["train/loss_residual"] = float(loss_residual.item())
+
+                    # Audio metrics (only occasionally to save time)
+                    if rec is not None and total_steps % 10 == 0:
+                        try:
+                            m = stereo_metrics_inline(wav, rec.detach())
+                            for k, v in m.items():
+                                log[f"audio/{k}"] = v
+                        except Exception:
+                            pass
+
+                    wandb.log(log, step=total_steps)
+                except Exception as e:
+                    if total_steps == 0:
+                        print(f"wandb log failed at step {total_steps}: {e}")
+
+            # Checkpoint saving
             if cfg["save_every"] and total_steps % cfg["save_every"] == 0 and accelerator.is_main_process:
                 save_ckpt({"model": accelerator.unwrap_model(model).state_dict(), "opt": opt.state_dict(), "step": total_steps},
                           os.path.join(cfg["output"]["ckpt_dir"], f"step_{total_steps}.pt"))
 
-            if cfg["logging"]["use_wandb"] and accelerator.is_main_process:
-                try:
-                    import wandb
-                    log = {"loss": float(loss.item()), "step": total_steps}
-                    if rec is not None:
-                        try:
-                            m = stereo_metrics_inline(wav, rec.detach())
-                            for k, v in m.items():
-                                log[f"stereo/{k}"] = v
-                        except Exception:
-                            pass
-                    wandb.log(log, step=total_steps)
-                except Exception:
-                    pass
+            # Clean up references for better memory management (after logging)
+            del enc, rec, loss_consistency, loss_stereo_corr, loss_residual, loss_align, loss_contrast
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            pbar.set_postfix({"loss": float(loss.item()), "step": total_steps})
 
     if ema is not None and accelerator.is_main_process:
         model_to_save = accelerator.unwrap_model(model)
