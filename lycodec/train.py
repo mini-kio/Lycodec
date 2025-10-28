@@ -27,16 +27,6 @@ def load_config(path):
 def build_model_from_config(cfg):
     """Build Lycodec model from configuration dictionary."""
 
-    # Quantizer configuration
-    quantizer_type = cfg["model"].get("quantizer_type", "pq")
-    use_multi_stage = cfg["model"].get("use_multi_stage_rvq", False)
-    rvq_num_stages = cfg["model"].get("rvq_num_stages", 2)
-
-    # Stage-specific configs (if provided in YAML)
-    stage_commitment_weights = cfg["model"].get("rvq_stage_commitment_weights", None)
-    stage_tau_configs = cfg["model"].get("rvq_stage_tau_configs", None)
-    stage_drop_configs = cfg["model"].get("rvq_stage_drop_configs", None)
-
     # Calculate token_fps: tokens per second (Hz)
     # NOTE: Model internally uses this as sequence length for training clips
     # e.g., 24 Hz * 1.5s = 36 tokens/clip, but we still call it "fps" (frequency)
@@ -44,11 +34,11 @@ def build_model_from_config(cfg):
     crop_seconds = cfg.get("crop_seconds", 1.5)
     tokens_per_clip = int(token_fps_hz * crop_seconds)  # e.g., 24 * 1.5 = 36
 
-    ema_decay = cfg["model"].get("ema_decay", cfg["model"].get("rvq_ema_decay", 0.97))
-    awakening_steps = cfg["model"].get("awakening_steps", cfg["model"].get("rvq_awakening_steps", 200))
-    drop_start = cfg["model"].get("drop_start", cfg["model"].get("rvq_drop_start", 0.6))
-    drop_end = cfg["model"].get("drop_end", cfg["model"].get("rvq_drop_end", 0.1))
-    drop_decay_steps = cfg["model"].get("drop_decay_steps", cfg["model"].get("rvq_drop_decay_steps", 200000))
+    ema_decay = cfg["model"].get("ema_decay", 0.97)
+    awakening_steps = cfg["model"].get("awakening_steps", 200)
+    drop_start = cfg["model"].get("drop_start", 0.6)
+    drop_end = cfg["model"].get("drop_end", 0.1)
+    drop_decay_steps = cfg["model"].get("drop_decay_steps", 200000)
     pq_M = cfg["model"].get("pq_M", 4)
     pq_K = cfg["model"].get("pq_K", 256)
 
@@ -68,10 +58,8 @@ def build_model_from_config(cfg):
         decoder_embed_dim=cfg["model"].get("decoder_embed_dim", 512),
         decoder_mlp_ratio=cfg["model"].get("decoder_mlp_ratio", 4.0),
         decoder_cond_ch=cfg["model"].get("decoder_cond_ch", 64),
-        quantizer_type=quantizer_type,
         pq_M=pq_M,
         pq_K=pq_K,
-        rvq_codebook_size=cfg["model"].get("rvq_codebook_size", 4096),
         ema_decay=ema_decay,
         awakening_steps=awakening_steps,
         token_fps=tokens_per_clip,  # tokens per second (frequency), passed as clip length
@@ -80,29 +68,11 @@ def build_model_from_config(cfg):
         drop_decay_steps=drop_decay_steps,
         use_residual_corrector=cfg["model"].get("use_residual_corrector", True),
         corrector_alpha=cfg["model"].get("corrector_alpha", 0.3),
-        # Multi-stage RVQ (Phase 2)
-        use_multi_stage_rvq=use_multi_stage,
-        rvq_num_stages=rvq_num_stages,
-        rvq_stage_commitment_weights=stage_commitment_weights,
-        rvq_stage_tau_configs=stage_tau_configs,
-        rvq_stage_drop_configs=stage_drop_configs,
-        rvq_fusion_mode=cfg["model"].get("rvq_fusion_mode", "weighted_sum"),
     )
 
     # Set training-specific parameters (not part of model architecture)
-    quantizer_warmup = cfg["train"].get("quantizer_warmup_steps", cfg["train"].get("rvq_warmup_steps", 5000))
+    quantizer_warmup = cfg["train"].get("quantizer_warmup_steps", 5000)
     model.quantizer_warmup_steps = quantizer_warmup
-    # Backward-compatible attribute for older checkpoints
-    model.rvq_warmup_steps = quantizer_warmup
-
-    # Set Gumbel temperature annealing parameters on RVQ
-    # For multi-stage, these are already set in MultiStageRVQ constructor via stage_tau_configs
-    # For single-stage, set them here
-    if model.quantizer_type == 'rvq' and not use_multi_stage:
-        quantizer = model.quantizer
-        quantizer.tau_hi = cfg["train"].get("gumbel_tau_hi", 2.0)
-        quantizer.tau_lo = cfg["train"].get("gumbel_tau_lo", 0.5)
-        quantizer.tau_decay_steps = cfg["train"].get("gumbel_tau_decay_steps", 10000)
 
     return model
 
@@ -312,14 +282,14 @@ def train(cfg_path, data_root):
                     loss_stereo_corr = stereo_corr_loss(wav, rec)
                     loss = loss + stereo_corr_weight * loss_stereo_corr
 
-                # RVQ losses
+                # Quantizer losses
                 loss_entropy_bonus = None
 
                 # Commitment loss (increased weight for stability)
                 if "commitment_loss" in enc:
-                    loss = loss + enc["commitment_loss"]  # Already weighted inside RVQ (0.5)
+                    loss = loss + enc["commitment_loss"]  # Already weighted inside quantizer (0.5)
 
-                # Entropy bonus (only in early training, computed in RVQ forward)
+                # Entropy bonus (only in early training, computed in quantizer forward)
                 if "entropy_bonus" in enc:
                     loss_entropy_bonus = enc["entropy_bonus"]
                     loss = loss + loss_entropy_bonus

@@ -22,27 +22,14 @@ model:
   use_rope: true
   token_fps: 24  # Tokens per second (24 fps × 1.5 sec crop = 36 tokens per clip)
 
-  # Multi-stage RVQ: 2×4096 codebook → 24 bits/frame × 24 fps ≈ 0.576 kbps
-  use_multi_stage_rvq: true
-  rvq_num_stages: 2
-  rvq_codebook_size: 4096
-  rvq_ema_decay: 0.995
-  rvq_awakening_steps: 50
-  rvq_fusion_mode: weighted_sum  # weighted_sum | concat_linear
-
-  # Stage-specific configs
-  rvq_stage_commitment_weights: [1.25, 0.5]  # Stage 1: high (stability), Stage 2: low (refinement)
-  rvq_stage_tau_configs:  # [tau_hi, tau_lo, decay_steps]
-    - [2.0, 0.5, 10000]   # Stage 1: normal schedule
-    - [2.5, 0.5, 20000]   # Stage 2: longer exploration
-  rvq_stage_drop_configs:  # [drop_start, drop_end, decay_steps]
-    - [0.0, 0.0, 0]        # Stage 1: no dropout
-    - [0.6, 0.1, 200000]   # Stage 2: dropout for diversity
-
-  # Single-stage RVQ (fallback when use_multi_stage_rvq=false)
-  rvq_drop_start: 0.6
-  rvq_drop_end: 0.1
-  rvq_drop_decay_steps: 100000
+  # OPQ-PQ quantizer (4 subspaces × 8-bit codebooks = 32 bits/token)
+  pq_M: 4
+  pq_K: 256
+  ema_decay: 0.97
+  awakening_steps: 200
+  drop_start: 0.6
+  drop_end: 0.1
+  drop_decay_steps: 200000
 
   use_residual_corrector: true
   corrector_alpha: 0.3
@@ -60,11 +47,7 @@ train:
   gradient_accumulation_steps: 4
   use_checkpoint: true
 
-  # RVQ warmup and temperature (single-stage only, multi-stage uses stage_tau_configs)
-  rvq_warmup_steps: 1000
-  gumbel_tau_hi: 3.0
-  gumbel_tau_lo: 0.5
-  gumbel_tau_decay_steps: 20000
+  quantizer_warmup_steps: 1000
 
   # Loss weight schedules [step, weight]
   residual_weight_schedule:
