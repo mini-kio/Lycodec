@@ -27,7 +27,8 @@ def load_config(path):
 def build_model_from_config(cfg):
     """Build Lycodec model from configuration dictionary."""
 
-    # Parse multi-stage RVQ configs
+    # Quantizer configuration
+    quantizer_type = cfg["model"].get("quantizer_type", "pq")
     use_multi_stage = cfg["model"].get("use_multi_stage_rvq", False)
     rvq_num_stages = cfg["model"].get("rvq_num_stages", 2)
 
@@ -42,6 +43,14 @@ def build_model_from_config(cfg):
     token_fps_hz = cfg["model"].get("token_fps", 24)  # tokens per second (Hz)
     crop_seconds = cfg.get("crop_seconds", 1.5)
     tokens_per_clip = int(token_fps_hz * crop_seconds)  # e.g., 24 * 1.5 = 36
+
+    ema_decay = cfg["model"].get("ema_decay", cfg["model"].get("rvq_ema_decay", 0.97))
+    awakening_steps = cfg["model"].get("awakening_steps", cfg["model"].get("rvq_awakening_steps", 200))
+    drop_start = cfg["model"].get("drop_start", cfg["model"].get("rvq_drop_start", 0.6))
+    drop_end = cfg["model"].get("drop_end", cfg["model"].get("rvq_drop_end", 0.1))
+    drop_decay_steps = cfg["model"].get("drop_decay_steps", cfg["model"].get("rvq_drop_decay_steps", 200000))
+    pq_M = cfg["model"].get("pq_M", 4)
+    pq_K = cfg["model"].get("pq_K", 256)
 
     model = Lycodec(
         sr=cfg["sample_rate"],
@@ -59,13 +68,16 @@ def build_model_from_config(cfg):
         decoder_embed_dim=cfg["model"].get("decoder_embed_dim", 512),
         decoder_mlp_ratio=cfg["model"].get("decoder_mlp_ratio", 4.0),
         decoder_cond_ch=cfg["model"].get("decoder_cond_ch", 64),
+        quantizer_type=quantizer_type,
+        pq_M=pq_M,
+        pq_K=pq_K,
         rvq_codebook_size=cfg["model"].get("rvq_codebook_size", 4096),
-        rvq_ema_decay=cfg["model"].get("rvq_ema_decay", 0.97),
-        rvq_awakening_steps=cfg["model"].get("rvq_awakening_steps", 200),
+        ema_decay=ema_decay,
+        awakening_steps=awakening_steps,
         token_fps=tokens_per_clip,  # tokens per second (frequency), passed as clip length
-        rvq_drop_start=cfg["model"].get("rvq_drop_start", 0.6),
-        rvq_drop_end=cfg["model"].get("rvq_drop_end", 0.1),
-        rvq_drop_decay_steps=cfg["model"].get("rvq_drop_decay_steps", 200000),
+        drop_start=drop_start,
+        drop_end=drop_end,
+        drop_decay_steps=drop_decay_steps,
         use_residual_corrector=cfg["model"].get("use_residual_corrector", True),
         corrector_alpha=cfg["model"].get("corrector_alpha", 0.3),
         # Multi-stage RVQ (Phase 2)
@@ -78,15 +90,19 @@ def build_model_from_config(cfg):
     )
 
     # Set training-specific parameters (not part of model architecture)
-    model.rvq_warmup_steps = cfg["train"].get("rvq_warmup_steps", 5000)
+    quantizer_warmup = cfg["train"].get("quantizer_warmup_steps", cfg["train"].get("rvq_warmup_steps", 5000))
+    model.quantizer_warmup_steps = quantizer_warmup
+    # Backward-compatible attribute for older checkpoints
+    model.rvq_warmup_steps = quantizer_warmup
 
     # Set Gumbel temperature annealing parameters on RVQ
     # For multi-stage, these are already set in MultiStageRVQ constructor via stage_tau_configs
     # For single-stage, set them here
-    if not use_multi_stage:
-        model.rvq.tau_hi = cfg["train"].get("gumbel_tau_hi", 2.0)
-        model.rvq.tau_lo = cfg["train"].get("gumbel_tau_lo", 0.5)
-        model.rvq.tau_decay_steps = cfg["train"].get("gumbel_tau_decay_steps", 10000)
+    if model.quantizer_type == 'rvq' and not use_multi_stage:
+        quantizer = model.quantizer
+        quantizer.tau_hi = cfg["train"].get("gumbel_tau_hi", 2.0)
+        quantizer.tau_lo = cfg["train"].get("gumbel_tau_lo", 0.5)
+        quantizer.tau_decay_steps = cfg["train"].get("gumbel_tau_decay_steps", 10000)
 
     return model
 
@@ -308,6 +324,11 @@ def train(cfg_path, data_root):
                     loss_entropy_bonus = enc["entropy_bonus"]
                     loss = loss + loss_entropy_bonus
 
+                # Orthogonal regularization for OPQ-PQ
+                ortho_loss = enc.get("ortho_loss", None)
+                if ortho_loss is not None:
+                    loss = loss + ortho_loss
+
                 # Residual loss (scheduled activation, only when not using dropout)
                 loss_residual = None
                 loss_align = None
@@ -370,23 +391,25 @@ def train(cfg_path, data_root):
                     if loss_residual is not None:
                         log["train/loss_residual"] = float(loss_residual.item())
 
-                    # RVQ metrics
+                    # Quantizer metrics
                     if "commitment_loss" in enc:
-                        log["rvq/commitment_loss"] = float(enc["commitment_loss"].item())
+                        log["quantizer/commitment_loss"] = float(enc["commitment_loss"].item())
                     if "entropy_bonus" in enc and enc["entropy_bonus"].item() != 0:
-                        log["rvq/entropy_bonus"] = float(enc["entropy_bonus"].item())
+                        log["quantizer/entropy_bonus"] = float(enc["entropy_bonus"].item())
                     if "perplexity" in enc:
-                        log["rvq/perplexity"] = float(enc["perplexity"])
+                        log["quantizer/perplexity"] = float(enc["perplexity"])
                     if "usage_entropy" in enc:
-                        log["rvq/usage_entropy"] = float(enc["usage_entropy"])
+                        log["quantizer/usage_entropy"] = float(enc["usage_entropy"])
                     if "drop_prob" in enc:
-                        log["rvq/drop_prob"] = float(enc["drop_prob"])
+                        log["quantizer/drop_prob"] = float(enc["drop_prob"])
                     if "dropout_applied" in enc:
-                        log["rvq/dropout_applied"] = int(enc["dropout_applied"])
+                        log["quantizer/dropout_applied"] = int(enc["dropout_applied"])
                     if "active_codes" in enc:
-                        log["rvq/active_codes"] = int(enc["active_codes"])
+                        log["quantizer/active_codes"] = int(enc["active_codes"])
                     if "current_tau" in enc:
-                        log["rvq/current_tau"] = float(enc["current_tau"])
+                        log["quantizer/current_tau"] = float(enc["current_tau"])
+                    if "ortho_loss" in enc and enc["ortho_loss"].requires_grad:
+                        log["quantizer/ortho_loss"] = float(enc["ortho_loss"].item())
 
                     # Corrector losses
                     if loss_residual is not None:

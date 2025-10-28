@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from lycodec.utils.audio import resample_time
 
 
@@ -258,6 +259,352 @@ class TemporalResampler(nn.Module):
         x = resample_time(x, self.t_out)
         x = self.proj(x.transpose(1, 2)).transpose(1, 2)
         return x
+
+
+class OPQPQQuantizer(nn.Module):
+    """
+    Optimized Product Quantization with learnable rotation (OPQ-PQ).
+
+    Applies learnable orthogonal rotation before splitting into M subspaces.
+    Each subspace is quantized independently with its own codebook.
+    More efficient for LLM downstream (fewer tokens) than multi-stage RVQ.
+
+    Key features:
+    - Learnable rotation matrix W (D × D) for optimal subspace alignment
+    - Orthogonal regularization to maintain W^T W ≈ I
+    - Periodic QR decomposition for stability
+    - M independent codebooks with EMA updates
+    - Gumbel-Softmax for differentiable quantization
+
+    Args:
+        dim: embedding dimension (must be divisible by M)
+        M: number of subspaces (e.g., 4)
+        K: codebook size per subspace (e.g., 256 for 8bit)
+        ema_decay: EMA decay for codebook updates
+        awakening_steps: steps between dead code resets
+        gumbel_temp: initial Gumbel-Softmax temperature
+        drop_start/end: dropout probability schedule
+        ortho_penalty: weight for W^T W - I regularization
+        qr_every: steps between QR decomposition (0 = disabled)
+    """
+
+    def __init__(self, dim=256, M=4, K=256, ema_decay=0.97, awakening_steps=200,
+                 gumbel_temp=1.0, drop_start=0.6, drop_end=0.1, drop_decay_steps=200000,
+                 ortho_penalty=1e-4, qr_every=500):
+        super().__init__()
+        assert dim % M == 0, f"dim ({dim}) must be divisible by M ({M})"
+
+        self.dim = dim
+        self.M = M  # number of subspaces
+        self.K = K  # codebook size per subspace
+        self.D_sub = dim // M  # subspace dimension
+        self.ema_decay = ema_decay
+        self.awakening_steps = awakening_steps
+        self.gumbel_temp = gumbel_temp
+        self.drop_start = float(drop_start)
+        self.drop_end = float(drop_end)
+        self.drop_decay_steps = int(drop_decay_steps)
+        self.ortho_penalty = ortho_penalty
+        self.qr_every = qr_every
+
+        # Learnable rotation matrix (initialized as identity)
+        self.W = nn.Parameter(torch.eye(dim))
+
+        # M independent codebooks (each K x D_sub)
+        for m in range(M):
+            self.register_buffer(f'codebook_{m}', torch.randn(K, self.D_sub))
+            self.register_buffer(f'codebook_usage_{m}', torch.zeros(K))
+            self.register_buffer(f'ema_cluster_size_{m}', torch.zeros(K))
+            self.register_buffer(f'ema_embed_avg_{m}', torch.zeros(K, self.D_sub))
+
+        self.register_buffer('step_counter', torch.zeros(1, dtype=torch.long))
+
+        bits_per_token = M * math.log2(K)
+        print(f"[OPQ-PQ] Initialized: M={M}, K={K}, dim={dim}, D_sub={self.D_sub}")
+        print(f"[OPQ-PQ] Bits/token={bits_per_token:.1f}, ortho_penalty={ortho_penalty}, qr_every={qr_every}")
+        print(f"[OPQ-PQ] Dropout schedule: {self.drop_start}->{self.drop_end} over {drop_decay_steps} steps")
+
+    def _get_codebook(self, m):
+        """Get codebook for subspace m"""
+        return getattr(self, f'codebook_{m}')
+
+    def _get_usage(self, m):
+        """Get usage for subspace m"""
+        return getattr(self, f'codebook_usage_{m}')
+
+    def _compute_distances(self, z_m, codebook_m):
+        """
+        Compute distances for one subspace using cosine distance.
+
+        Args:
+            z_m: [B*T, D_sub]
+            codebook_m: [K, D_sub]
+        Returns:
+            distances: [B*T, K]
+        """
+        # L2 normalize
+        z_norm = F.normalize(z_m, dim=-1)
+        codebook_norm = F.normalize(codebook_m, dim=-1)
+        # Cosine distance
+        cosine_sim = z_norm @ codebook_norm.t()
+        distances = 1.0 - cosine_sim
+        return distances
+
+    def _gumbel_softmax_st(self, logits, tau):
+        """Gumbel-Softmax with straight-through estimator"""
+        gumbel = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+        logits_with_gumbel = (logits + gumbel) / tau
+        soft_codes = F.softmax(logits_with_gumbel, dim=-1)
+        indices = soft_codes.argmax(dim=-1)
+        hard_codes = F.one_hot(indices, num_classes=self.K).float()
+        codes = hard_codes - soft_codes.detach() + soft_codes
+        return codes, indices
+
+    def _update_ema(self, m, z_m, indices_m):
+        """Update EMA for subspace m"""
+        if not self.training:
+            return
+
+        with torch.no_grad():
+            z_flat = z_m.reshape(-1, self.D_sub)
+            indices_flat = indices_m.reshape(-1)
+            encodings = F.one_hot(indices_flat, num_classes=self.K).float()
+
+            n_i = encodings.sum(dim=0)
+
+            # Update EMA
+            ema_cluster_size = getattr(self, f'ema_cluster_size_{m}')
+            ema_embed_avg = getattr(self, f'ema_embed_avg_{m}')
+            codebook = getattr(self, f'codebook_{m}')
+            usage = getattr(self, f'codebook_usage_{m}')
+
+            ema_cluster_size.mul_(self.ema_decay).add_(n_i, alpha=1 - self.ema_decay)
+            sum_i = encodings.t() @ z_flat
+            ema_embed_avg.mul_(self.ema_decay).add_(sum_i, alpha=1 - self.ema_decay)
+
+            n = ema_cluster_size.sum()
+            cluster_size = (ema_cluster_size + 1e-5) / (n + self.K * 1e-5) * n
+            codebook.copy_(ema_embed_avg / cluster_size.unsqueeze(1))
+
+            usage.mul_(0.99)
+            usage.add_(n_i)
+
+    def _awaken_dead_codes(self, m, z_m):
+        """Awaken dead codes for subspace m"""
+        if not self.training:
+            return
+
+        with torch.no_grad():
+            usage = getattr(self, f'codebook_usage_{m}')
+            codebook = getattr(self, f'codebook_{m}')
+            ema_cluster_size = getattr(self, f'ema_cluster_size_{m}')
+            ema_embed_avg = getattr(self, f'ema_embed_avg_{m}')
+
+            usage_threshold = usage.mean() * 0.1
+            dead_mask = usage < usage_threshold
+            num_dead = int(dead_mask.sum().item())
+            if num_dead == 0:
+                return
+
+            min_reset = max(5, int(self.K * 0.05))
+            if num_dead < min_reset:
+                _, indices = torch.topk(usage, min_reset, largest=False)
+                dead_mask = torch.zeros(self.K, dtype=torch.bool, device=z_m.device)
+                dead_mask[indices] = True
+                num_dead = min_reset
+
+            z_flat = z_m.reshape(-1, self.D_sub)
+            if num_dead > z_flat.shape[0]:
+                random_idx = torch.randint(0, z_flat.shape[0], (num_dead,), device=z_m.device)
+            else:
+                random_idx = torch.randperm(z_flat.shape[0], device=z_m.device)[:num_dead]
+
+            codebook[dead_mask] = z_flat[random_idx] + torch.randn(num_dead, self.D_sub, device=z_m.device) * 0.02
+            usage[dead_mask] = usage.mean()
+            ema_cluster_size[dead_mask] = 1.0
+            ema_embed_avg[dead_mask] = codebook[dead_mask]
+
+    def _current_drop_prob(self):
+        if self.drop_decay_steps <= 0:
+            return self.drop_end
+        step = int(self.step_counter.item())
+        if step >= self.drop_decay_steps:
+            return self.drop_end
+        ratio = 1.0 - (step / float(self.drop_decay_steps))
+        return self.drop_end + (self.drop_start - self.drop_end) * ratio
+
+    def current_drop_prob(self):
+        return float(self._current_drop_prob())
+
+    def orthogonal_regularization(self):
+        """Compute W^T W - I Frobenius norm for orthogonality loss"""
+        WtW = self.W.T @ self.W
+        I = torch.eye(self.dim, device=self.W.device, dtype=self.W.dtype)
+        return torch.norm(WtW - I, p='fro') ** 2
+
+    def apply_qr_decomposition(self):
+        """Apply QR decomposition to W for re-orthogonalization"""
+        with torch.no_grad():
+            Q, R = torch.linalg.qr(self.W)
+            # Ensure positive diagonal in R for uniqueness
+            signs = torch.sign(torch.diag(R))
+            signs[signs == 0] = 1
+            Q = Q * signs.unsqueeze(0)
+            self.W.copy_(Q)
+
+    def forward(self, z, training=True):
+        """
+        Args:
+            z: continuous latent [B, T, D]
+            training: whether in training mode
+
+        Returns:
+            dict with keys:
+                - z_q: quantized embedding [B, T, D]
+                - embedding: quantized embedding (same as z_q)
+                - indices: subspace indices [B, T, M]
+                - commitment_loss: commitment loss scalar
+                - ortho_loss: orthogonal regularization loss
+                - perplexity: average perplexity across subspaces
+                - usage_entropy: average entropy across subspaces
+                - drop_prob: current dropout probability
+                - active_codes: average active codes across subspaces
+                - current_tau: current Gumbel temperature
+        """
+        B, T, D = z.shape
+        device = z.device
+
+        # Apply OPQ rotation
+        z_flat = z.reshape(-1, D)  # [B*T, D]
+        z_rot_flat = z_flat @ self.W  # [B*T, D]
+        z_rot = z_rot_flat.reshape(B, T, D)  # [B, T, D]
+
+        # Split into M subspaces
+        z_split = z_rot.reshape(B, T, self.M, self.D_sub)  # [B, T, M, D_sub]
+
+        indices_list = []
+        embeddings_list = []
+        commitment_losses = []
+        perplexities = []
+        entropies = []
+        active_codes_list = []
+
+        # Gumbel temperature annealing
+        if training:
+            tau_hi = getattr(self, 'tau_hi', 2.0)
+            tau_lo = getattr(self, 'tau_lo', 0.5)
+            decay_steps = getattr(self, 'tau_decay_steps', 10000.0)
+            step = self.step_counter.float()
+            current_tau = tau_lo + (tau_hi - tau_lo) * torch.exp(-step / decay_steps)
+        else:
+            current_tau = torch.tensor(0.5, device=device)
+
+        # Process each subspace independently
+        for m in range(self.M):
+            z_m = z_split[:, :, m, :]  # [B, T, D_sub]
+            codebook_m = self._get_codebook(m)
+
+            z_m_flat = z_m.reshape(-1, self.D_sub)  # [B*T, D_sub]
+            distances = self._compute_distances(z_m_flat, codebook_m)  # [B*T, K]
+            distances = distances.reshape(B, T, self.K)
+
+            if training:
+                logits = -distances
+                codes, indices_m = self._gumbel_softmax_st(logits, current_tau.item())
+                quantized_m = torch.einsum('btk,kd->btd', codes, codebook_m)
+                hard_indices_m = indices_m
+                embedding_m = F.embedding(hard_indices_m, codebook_m)
+
+                self._update_ema(m, z_m, hard_indices_m)
+
+                with torch.no_grad():
+                    step = int(self.step_counter.item())
+                    if self.awakening_steps > 0 and step > 0 and (step % self.awakening_steps == 0):
+                        self._awaken_dead_codes(m, z_m)
+            else:
+                hard_indices_m = distances.argmin(dim=-1)
+                embedding_m = F.embedding(hard_indices_m, codebook_m)
+                quantized_m = embedding_m
+
+            indices_list.append(hard_indices_m)
+            embeddings_list.append(embedding_m)
+
+            # Commitment loss for this subspace
+            commitment_m = F.mse_loss(quantized_m.detach(), z_m)
+            commitment_losses.append(commitment_m)
+
+            # Statistics
+            usage_m = self._get_usage(m)
+            usage_sum = usage_m.sum()
+            if usage_sum > 0:
+                usage_prob = usage_m / (usage_sum + 1e-10)
+            else:
+                usage_prob = torch.full_like(usage_m, 1.0 / self.K)
+            entropy_m = -(usage_prob * torch.log(usage_prob + 1e-10)).sum()
+            perplexity_m = torch.exp(entropy_m)
+
+            perplexities.append(perplexity_m.detach())
+            entropies.append(entropy_m.detach())
+
+            if training:
+                active_codes_m = hard_indices_m.unique().numel()
+                active_codes_list.append(active_codes_m)
+
+        # Concatenate subspaces (in rotated space)
+        z_q_cat_rot = torch.cat(embeddings_list, dim=-1)  # [B, T, D] in rotated space
+        indices_stacked = torch.stack(indices_list, dim=-1)  # [B, T, M]
+
+        # Inverse rotation: W^T to original space
+        z_q_cat_rot_flat = z_q_cat_rot.reshape(-1, D)  # [B*T, D]
+        z_q_cat_flat = z_q_cat_rot_flat @ self.W.T  # [B*T, D] inverse rotation
+        z_q_cat = z_q_cat_flat.reshape(B, T, D)  # [B, T, D] in original space
+
+        # Straight-through estimator
+        z_q = z + (z_q_cat - z).detach()
+
+        # Aggregate losses and stats
+        commitment_loss = sum(commitment_losses) / len(commitment_losses)
+        mean_perplexity = torch.stack(perplexities).mean()
+        mean_entropy = torch.stack(entropies).mean()
+
+        # Orthogonal regularization
+        ortho_loss = self.orthogonal_regularization() * self.ortho_penalty if training else torch.tensor(0.0, device=device)
+
+        # QR decomposition for W re-orthogonalization (periodic)
+        if training and self.qr_every > 0:
+            step = int(self.step_counter.item())
+            if step > 0 and step % self.qr_every == 0:
+                self.apply_qr_decomposition()
+
+        # Increment step counter
+        if training:
+            with torch.no_grad():
+                self.step_counter += 1
+
+        drop_prob = self._current_drop_prob() if training else 0.0
+        active_codes = sum(active_codes_list) / len(active_codes_list) if training else 0
+
+        # Entropy bonus (only in early training)
+        entropy_bonus = torch.tensor(0.0, device=device)
+        if training:
+            step = int(self.step_counter.item())
+            if step < 20000:
+                bonus_weight = 0.05 * (1.0 - step / 20000.0)
+                entropy_bonus = -bonus_weight * mean_entropy
+
+        return {
+            'z_q': z_q,
+            'embedding': z_q_cat,
+            'indices': indices_stacked,  # [B, T, M]
+            'commitment_loss': commitment_loss * 0.5,  # same weight as RVQ
+            'ortho_loss': ortho_loss,  # orthogonal regularization
+            'entropy_bonus': entropy_bonus,
+            'perplexity': mean_perplexity,
+            'usage_entropy': mean_entropy,
+            'drop_prob': float(drop_prob),
+            'active_codes': active_codes,
+            'current_tau': current_tau.item() if training else 0.0,
+        }
 
 
 class RVQQuantizer(nn.Module):
@@ -646,8 +993,86 @@ class MultiStageRVQ(nn.Module):
         }
 
 
+class PQResidualCorrector(nn.Module):
+    """
+    Product Quantization Residual Corrector.
+
+    Predicts residual offsets from M subspace indices.
+    Each subspace index is embedded independently, then concatenated.
+
+    Args:
+        dim: full embedding dimension
+        M: number of subspaces
+        K: codebook size per subspace
+        context_size: conv kernel size for temporal context
+    """
+
+    def __init__(self, dim=256, M=4, K=256, context_size=5):
+        super().__init__()
+        assert dim % M == 0, f"dim ({dim}) must be divisible by M ({M})"
+
+        self.dim = dim
+        self.M = M
+        self.K = K
+        self.D_sub = dim // M
+        self.context_size = context_size
+
+        # M separate embeddings for each subspace
+        self.subcode_embeds = nn.ModuleList([
+            nn.Embedding(K, self.D_sub) for _ in range(M)
+        ])
+
+        # Context conv on concatenated embeddings
+        self.context_conv = nn.Sequential(
+            ConvNormAct1d(dim, dim, kernel_size=context_size, padding=context_size // 2),
+            ConvNormAct1d(dim, dim, kernel_size=context_size, padding=context_size // 2),
+        )
+
+        # Residual predictor
+        self.predictor = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim * 2, dim),
+        )
+
+        print(f"[PQResidualCorrector] M={M}, K={K}, D_sub={self.D_sub}, context={context_size}")
+
+    def forward(self, indices):
+        """
+        Args:
+            indices: [B, T, M] - M subspace indices per token
+
+        Returns:
+            residual: [B, T, D] - predicted residual correction
+        """
+        if indices is None:
+            return None
+
+        B, T, M = indices.shape
+        assert M == self.M, f"Expected M={self.M}, got {M}"
+
+        # Embed each subspace independently
+        embs = []
+        for m in range(self.M):
+            emb_m = self.subcode_embeds[m](indices[:, :, m])  # [B, T, D_sub]
+            embs.append(emb_m)
+
+        # Concatenate along feature dim
+        x = torch.cat(embs, dim=-1)  # [B, T, D]
+
+        # Apply context conv
+        x = x.transpose(1, 2)  # [B, D, T]
+        context = self.context_conv(x).transpose(1, 2)  # [B, T, D]
+
+        # Predict residual
+        residual = self.predictor(context)
+
+        return residual
+
+
 class ResidualCorrector(nn.Module):
-    """Predict residual offsets from codebook indices only."""
+    """Predict residual offsets from codebook indices only (for RVQ)."""
 
     def __init__(self, dim=256, codebook_size=4096, context_size=5):
         super().__init__()

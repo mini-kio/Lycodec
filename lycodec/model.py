@@ -8,6 +8,8 @@ from lycodec.core.blocks import (
     RVQQuantizer,
     MultiStageRVQ,
     ResidualCorrector,
+    OPQPQQuantizer,
+    PQResidualCorrector,
 )
 from lycodec.core.decoders import (
     TokenConditioner,
@@ -31,11 +33,18 @@ class Lycodec(nn.Module):
                  use_checkpoint=False, use_rope=True,
                  decoder_depth=6, decoder_patch_size=16,
                  decoder_embed_dim=512, decoder_mlp_ratio=4.0, decoder_cond_ch=64,
-                 rvq_codebook_size=4096, rvq_ema_decay=0.97, rvq_awakening_steps=200,
+                 # Quantizer parameters
+                 quantizer_type='pq',  # 'pq' or 'rvq' or 'multi_rvq'
+                 # PQ params
+                 pq_M=4, pq_K=256,
+                 # RVQ params (kept for compatibility)
+                 rvq_codebook_size=4096,
+                 # Common params
+                 ema_decay=0.97, awakening_steps=200,
                  token_fps=24,  # tokens per second (e.g., 24 Hz)
-                 rvq_drop_start=0.6, rvq_drop_end=0.1, rvq_drop_decay_steps=200000,
+                 drop_start=0.6, drop_end=0.1, drop_decay_steps=200000,
                  use_residual_corrector=True, corrector_alpha=0.3,
-                 # Multi-stage RVQ (Phase 2)
+                 # Multi-stage RVQ params (deprecated, kept for compat)
                  use_multi_stage_rvq=False,
                  rvq_num_stages=2,
                  rvq_stage_commitment_weights=None,
@@ -51,7 +60,7 @@ class Lycodec(nn.Module):
         self.token_fps = token_fps  # tokens per second
         self.use_residual_corrector = use_residual_corrector
         self.corrector_alpha = float(max(0.0, min(corrector_alpha, 0.3)))
-        self.use_multi_stage_rvq = use_multi_stage_rvq
+        self.quantizer_type = quantizer_type
 
         self.patch = Patchifier(c_in=4, widths=(64, 128, 256, 512))
         self.enc_proj = nn.Conv2d(512, hidden, 1)
@@ -67,42 +76,83 @@ class Lycodec(nn.Module):
         self.to_token = nn.Linear(hidden, token_dim)
         self.shared_proj = nn.Linear(token_dim, token_dim)
 
-        # Multi-stage RVQ (Phase 2) or single-stage RVQ
-        if use_multi_stage_rvq:
-            self.rvq = MultiStageRVQ(
+        # Quantizer selection
+        if quantizer_type == 'pq':
+            # OPQ-PQ (Optimized Product Quantization)
+            self.quantizer = OPQPQQuantizer(
+                dim=token_dim,
+                M=pq_M,
+                K=pq_K,
+                ema_decay=ema_decay,
+                awakening_steps=awakening_steps,
+                gumbel_temp=1.0,
+                drop_start=drop_start,
+                drop_end=drop_end,
+                drop_decay_steps=drop_decay_steps,
+                ortho_penalty=1e-4,
+                qr_every=500,
+            )
+            print(f"[Lycodec] OPQ-PQ: M={pq_M}, K={pq_K}")
+
+            if use_residual_corrector:
+                print("[Lycodec] PQResidualCorrector enabled (alpha≤0.3)")
+                self.corrector = PQResidualCorrector(
+                    dim=token_dim,
+                    M=pq_M,
+                    K=pq_K,
+                    context_size=5,
+                )
+            else:
+                self.corrector = None
+
+        elif quantizer_type == 'multi_rvq':
+            # Multi-stage RVQ
+            self.quantizer = MultiStageRVQ(
                 num_stages=rvq_num_stages,
                 dim=token_dim,
                 codebook_size=rvq_codebook_size,
-                ema_decay=rvq_ema_decay,
-                awakening_steps=rvq_awakening_steps,
+                ema_decay=ema_decay,
+                awakening_steps=awakening_steps,
                 stage_commitment_weights=rvq_stage_commitment_weights,
                 stage_tau_configs=rvq_stage_tau_configs,
                 stage_drop_configs=rvq_stage_drop_configs,
                 fusion_mode=rvq_fusion_mode,
             )
-            print(f"[Lycodec] Multi-stage RVQ enabled: {rvq_num_stages} stages, fusion={rvq_fusion_mode}")
-        else:
-            self.rvq = RVQQuantizer(
-                dim=token_dim,
-                codebook_size=rvq_codebook_size,
-                ema_decay=rvq_ema_decay,
-                awakening_steps=rvq_awakening_steps,
-                gumbel_temp=1.0,
-                drop_start=rvq_drop_start,
-                drop_end=rvq_drop_end,
-                drop_decay_steps=rvq_drop_decay_steps,
-            )
-            print(f"[Lycodec] Single-stage RVQ: ema_decay={rvq_ema_decay}, awakening={rvq_awakening_steps}, dropout {rvq_drop_start}->{rvq_drop_end}")
+            print(f"[Lycodec] Multi-stage RVQ: {rvq_num_stages} stages, fusion={rvq_fusion_mode}")
 
-        if use_residual_corrector:
-            print("[Lycodec] ResidualCorrector enabled (alpha≤0.3)")
-            self.corrector = ResidualCorrector(
+            if use_residual_corrector:
+                print("[Lycodec] ResidualCorrector enabled (alpha≤0.3)")
+                self.corrector = ResidualCorrector(
+                    dim=token_dim,
+                    codebook_size=rvq_codebook_size,
+                    context_size=5,
+                )
+            else:
+                self.corrector = None
+
+        else:  # 'rvq' or default
+            # Single-stage RVQ
+            self.quantizer = RVQQuantizer(
                 dim=token_dim,
                 codebook_size=rvq_codebook_size,
-                context_size=5,
+                ema_decay=ema_decay,
+                awakening_steps=awakening_steps,
+                gumbel_temp=1.0,
+                drop_start=drop_start,
+                drop_end=drop_end,
+                drop_decay_steps=drop_decay_steps,
             )
-        else:
-            self.corrector = None
+            print(f"[Lycodec] Single-stage RVQ: ema_decay={ema_decay}, awakening={awakening_steps}")
+
+            if use_residual_corrector:
+                print("[Lycodec] ResidualCorrector enabled (alpha≤0.3)")
+                self.corrector = ResidualCorrector(
+                    dim=token_dim,
+                    codebook_size=rvq_codebook_size,
+                    context_size=5,
+                )
+            else:
+                self.corrector = None
 
         self.cond = TokenConditioner(token_dim=token_dim, cond_ch=decoder_cond_ch, t_out=113, f_bins=self.n_fft // 2 + 1)
         print(f"[Lycodec] TransformerDecoder2D depth={decoder_depth}, patch={decoder_patch_size}, embed={decoder_embed_dim}, mlp={decoder_mlp_ratio}, cond_ch={decoder_cond_ch}")
@@ -152,18 +202,22 @@ class Lycodec(nn.Module):
         # Two-stage detach: input detach + output detach to completely cut graph
         y_cont_target = self.shared_proj(z_continuous.detach()).detach()
 
-        rvq_out = self.rvq(z_continuous, training=self.training)
-        y_disc = self.shared_proj(rvq_out['embedding'])
+        quant_out = self.quantizer(z_continuous, training=self.training)
+        y_disc = self.shared_proj(quant_out['embedding'])
         y_disc_corrected = y_disc
 
         r_hat = None
         r_target = None
         if self.corrector is not None:
-            # For multi-stage RVQ, use first stage indices for corrector
-            # (or could concatenate/fuse indices - future enhancement)
-            indices_for_corrector = rvq_out['indices']
-            if self.use_multi_stage_rvq and isinstance(indices_for_corrector, list):
-                indices_for_corrector = indices_for_corrector[0]  # Use stage 1 indices
+            # Handle different index formats
+            indices_for_corrector = quant_out['indices']
+
+            # For multi-stage RVQ, use first stage indices
+            if self.quantizer_type == 'multi_rvq' and isinstance(indices_for_corrector, list):
+                indices_for_corrector = indices_for_corrector[0]
+
+            # For PQ, indices are [B, T, M] and corrector handles them directly
+            # For RVQ, indices are [B, T] and corrector handles them directly
 
             r_hat = self.corrector(indices_for_corrector)
             if r_hat is not None:
@@ -171,15 +225,15 @@ class Lycodec(nn.Module):
             if self.training:
                 r_target = y_cont_target - y_disc.detach()
 
-        # RVQ dropout with warmup (crucial for codebook learning!)
-        drop_prob = float(rvq_out['drop_prob']) if self.training else 0.0
+        # Dropout with warmup (crucial for codebook learning!)
+        drop_prob = float(quant_out['drop_prob']) if self.training else 0.0
         warmup_steps = getattr(self, 'rvq_warmup_steps', 5000)  # Read from config
 
-        # Get current step (for multi-stage, use first stage's counter)
-        if self.use_multi_stage_rvq:
-            current_step = float(self.rvq.quantizers[0].step_counter.item()) if self.training else warmup_steps + 1
+        # Get current step
+        if self.quantizer_type == 'multi_rvq':
+            current_step = float(self.quantizer.quantizers[0].step_counter.item()) if self.training else warmup_steps + 1
         else:
-            current_step = float(self.rvq.step_counter.item()) if self.training else warmup_steps + 1
+            current_step = float(self.quantizer.step_counter.item()) if self.training else warmup_steps + 1
 
         if current_step < warmup_steps:
             drop_prob = 0.0  # Force discrete path during warmup
@@ -198,15 +252,16 @@ class Lycodec(nn.Module):
 
         return {
             "tokens": tokens_for_decoder,
-            "indices": rvq_out['indices'],
-            "commitment_loss": rvq_out['commitment_loss'],
-            "entropy_bonus": rvq_out.get('entropy_bonus', torch.tensor(0.0, device=z_continuous.device)),
-            "perplexity": rvq_out['perplexity'],
-            "usage_entropy": rvq_out['usage_entropy'],
+            "indices": quant_out['indices'],
+            "commitment_loss": quant_out['commitment_loss'],
+            "entropy_bonus": quant_out.get('entropy_bonus', torch.tensor(0.0, device=z_continuous.device)),
+            "ortho_loss": quant_out.get('ortho_loss', torch.tensor(0.0, device=z_continuous.device)),
+            "perplexity": quant_out['perplexity'],
+            "usage_entropy": quant_out['usage_entropy'],
             "dropout_applied": dropout_applied,
             "drop_prob": drop_prob,
-            "active_codes": rvq_out.get('active_codes', 0),
-            "current_tau": rvq_out.get('current_tau', 0.0),
+            "active_codes": quant_out.get('active_codes', 0),
+            "current_tau": quant_out.get('current_tau', 0.0),
             "y_disc": y_disc_corrected,
             "y_disc_corrected": y_disc_corrected,
             "alignment_target": y_cont_target if self.training else None,
