@@ -28,11 +28,11 @@ model:
   ema_decay: 0.97
   awakening_steps: 200
   drop_start: 0.6
-  drop_end: 0.1
-  drop_decay_steps: 200000
+  drop_end: 0.25  # Balanced to expose discrete path (was 0.1 -> 0.3 -> 0.25)
+  drop_decay_steps: 100000  # Faster dropout decay (was 200000)
 
   use_residual_corrector: true
-  corrector_alpha: 0.3
+  corrector_alpha: 0.2  # Fine-tuned for better balance (was 0.3)
 
   # Decoder (optimized for 16GB VRAM)
   decoder_depth: 4
@@ -67,7 +67,10 @@ train:
 
   stereo_corr_weight_schedule:
     - [0, 0.0]
-    - [30000, 0.02]
+    - [10000, 0.01]
+    - [20000, 0.02]
+    - [30000, 0.05]
+    - [50000, 0.08]
 
   # Consistency model
   sigma_min: 0.002
@@ -88,6 +91,7 @@ data:
 output:
   ckpt_dir: runs/ckpts
   log_dir: runs/logs
+  resume_ckpt: "runs/ckpts/step_52000.pt"  # Latest checkpoint (Oct 29 06:09)
 
 logging:
   use_wandb: true

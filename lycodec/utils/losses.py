@@ -119,33 +119,61 @@ def alignment_loss(y_disc, y_cont_detached):
     y_cont_norm = F.normalize(y_cont_detached, dim=-1)
     return 1 - (y_disc_norm * y_cont_norm).sum(dim=-1).mean()
 
-def stereo_corr_loss(target, pred):
+def stereo_corr_loss(target, pred, chunk=2048):
     """
-    Stereo correlation loss to preserve stereo field characteristics.
+    Enhanced stereo loss combining frame-wise correlation and M/S energy ratio.
 
     Args:
         target: target waveform [B, 2, T]
         pred: predicted waveform [B, 2, T]
+        chunk: frame size for correlation computation (default 2048 ≈ 46ms at 44.1kHz)
 
     Returns:
-        absolute difference in correlation between L/R channels
+        combined loss: 0.7 * frame_corr_diff + 0.3 * ms_ratio_diff
     """
-    def compute_corr(x):
-        """Compute correlation between left and right channels."""
+    def _chunk_corr(x, chunk_size):
+        """Compute frame-wise L/R correlation; keep batch dim [B]."""
         if x.shape[1] != 2:
-            return torch.tensor(0.0, device=x.device)
-        l, r = x[:, 0], x[:, 1]  # [B, T]
-        # Center
+            return torch.zeros((x.shape[0],), device=x.device)  # [B]
+        B, C, T = x.shape
+        # Protect against T < chunk_size
+        if T < chunk_size:
+            chunk_size = T
+        T2 = (T // chunk_size) * chunk_size
+        x = x[..., :T2].reshape(B, C, -1, chunk_size)  # [B, 2, N, chunk]
+        l, r = x[:, 0], x[:, 1]  # [B, N, chunk]
+        # Center each frame
         l = l - l.mean(dim=-1, keepdim=True)
         r = r - r.mean(dim=-1, keepdim=True)
-        # Correlation
-        num = (l * r).sum(dim=-1)
+        # Correlation per frame
+        num = (l * r).sum(dim=-1)  # [B, N]
         den = (l.pow(2).sum(dim=-1) * r.pow(2).sum(dim=-1)).sqrt() + 1e-8
-        return (num / den).mean()
+        # Average over frames only, keep batch dim
+        return (num / den).mean(dim=-1)  # [B]
 
-    corr_target = compute_corr(target)
-    corr_pred = compute_corr(pred)
-    return (corr_target - corr_pred).abs()
+    def _ms_ratio(x):
+        """Return M/S energy ratio per sample [B] (no batch mean here)."""
+        if x.shape[1] != 2:
+            return torch.zeros((x.shape[0],), device=x.device)  # [B]
+        M = (x[:, 0] + x[:, 1]) * 0.5  # Mid
+        S = (x[:, 0] - x[:, 1]) * 0.5  # Side
+        eM = M.pow(2).mean(dim=-1)  # [B]
+        eS = S.pow(2).mean(dim=-1)  # [B]
+        # Side energy ratio, keep batch dim
+        return eS / (eM + eS + 1e-8)  # [B]
+
+    # Frame-wise correlation difference
+    corr_t = _chunk_corr(target, chunk)  # [B]
+    corr_p = _chunk_corr(pred, chunk)    # [B]
+    loss_corr = (corr_t - corr_p).abs().mean()  # batch mean here
+
+    # M/S energy ratio difference
+    ms_t = _ms_ratio(target)  # [B]
+    ms_p = _ms_ratio(pred)    # [B]
+    loss_ms = (ms_t - ms_p).abs().mean()  # batch mean here
+
+    # Blend: prioritize correlation, add MS ratio for anti-mono-collapse
+    return 0.7 * loss_corr + 0.3 * loss_ms
 
 def summary_contrast_loss(summary_a, summary_b, temperature=0.07, gather_fn=None):
     """

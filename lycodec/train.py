@@ -169,6 +169,31 @@ def train(cfg_path, data_root):
     total_steps = 0
     ema = EMA(accelerator.unwrap_model(model), decay=cfg["train"]["ema"].get("decay", 0.9999)) if cfg["train"]["ema"].get("enabled", False) else None
 
+    # Resume from checkpoint (if specified in config)
+    resume_ckpt_path = cfg["output"].get("resume_ckpt")
+    if resume_ckpt_path and os.path.exists(resume_ckpt_path):
+        sd = torch.load(resume_ckpt_path, map_location="cpu")
+        # Load model state (including quantizer step_counter)
+        model_unwrapped = accelerator.unwrap_model(model)
+
+        # Filter out RoPE cached buffers (they are regenerated in forward pass)
+        model_state = sd["model"]
+        filtered_state = {k: v for k, v in model_state.items()
+                         if not ('rope.cos_cached' in k or 'rope.sin_cached' in k)}
+
+        model_unwrapped.load_state_dict(filtered_state, strict=False)
+        # Load optimizer state
+        if "opt" in sd:
+            opt.load_state_dict(sd["opt"])
+        # Restore step counter (critical for schedule alignment)
+        if "step" in sd:
+            total_steps = int(sd["step"])
+        # Restore EMA shadow if available
+        if ema is not None and "ema_shadow" in sd:
+            ema.shadow = sd["ema_shadow"]
+        if accelerator.is_main_process:
+            print(f"[Resume] Loaded checkpoint from {resume_ckpt_path}, resuming from step={total_steps}")
+
     if cfg["logging"]["use_wandb"] and accelerator.is_main_process:
         try:
             import wandb
@@ -279,7 +304,8 @@ def train(cfg_path, data_root):
                 # Stereo correlation loss (OPTIMIZATION: reuse student prediction, no extra decode!)
                 loss_stereo_corr = None
                 if stereo_corr_weight > 0 and rec is not None:
-                    loss_stereo_corr = stereo_corr_loss(wav, rec)
+                    # Use finer chunk size (1024 ≈ 23ms) for stronger local gradients
+                    loss_stereo_corr = stereo_corr_loss(wav, rec, chunk=1024)
                     loss = loss + stereo_corr_weight * loss_stereo_corr
 
                 # Quantizer losses
@@ -401,8 +427,14 @@ def train(cfg_path, data_root):
 
             # Checkpoint saving
             if cfg["save_every"] and total_steps % cfg["save_every"] == 0 and accelerator.is_main_process:
-                save_ckpt({"model": accelerator.unwrap_model(model).state_dict(), "opt": opt.state_dict(), "step": total_steps},
-                          os.path.join(cfg["output"]["ckpt_dir"], f"step_{total_steps}.pt"))
+                ckpt_data = {
+                    "model": accelerator.unwrap_model(model).state_dict(),
+                    "opt": opt.state_dict(),
+                    "step": total_steps,
+                }
+                if ema is not None:
+                    ckpt_data["ema_shadow"] = ema.shadow
+                save_ckpt(ckpt_data, os.path.join(cfg["output"]["ckpt_dir"], f"step_{total_steps}.pt"))
 
             # Clean up references for better memory management (after logging)
             del enc, rec, loss_consistency, loss_stereo_corr, loss_residual, loss_align, loss_contrast
@@ -414,8 +446,14 @@ def train(cfg_path, data_root):
         model_to_save = accelerator.unwrap_model(model)
         ema.copy_to(model_to_save)
     if accelerator.is_main_process:
-        save_ckpt({"model": accelerator.unwrap_model(model).state_dict(), "opt": opt.state_dict(), "step": total_steps},
-                  os.path.join(cfg["output"]["ckpt_dir"], "latest.pt"))
+        ckpt_data = {
+            "model": accelerator.unwrap_model(model).state_dict(),
+            "opt": opt.state_dict(),
+            "step": total_steps,
+        }
+        if ema is not None:
+            ckpt_data["ema_shadow"] = ema.shadow
+        save_ckpt(ckpt_data, os.path.join(cfg["output"]["ckpt_dir"], "latest.pt"))
 
 
 def load_model(ckpt_path, cfg_path):

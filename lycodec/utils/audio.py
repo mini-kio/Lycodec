@@ -156,10 +156,25 @@ def stereo_metrics_inline(target, pred, eps=1e-8):
             )
             return corr.mean()
 
+        # Mid/Side energy ratio (detects mono collapse)
+        def ms_ratio(x):
+            M = (x[:, 0, :] + x[:, 1, :]) * 0.5  # Mid [B, T]
+            S = (x[:, 0, :] - x[:, 1, :]) * 0.5  # Side [B, T]
+            eM = M.pow(2).mean(dim=-1)  # [B]
+            eS = S.pow(2).mean(dim=-1)  # [B]
+            return (eS / (eM + eS + eps)).mean()
+
         corr_target = channel_corr(target)
         corr_pred = channel_corr(pred)
         metrics['stereo_corr_target'] = float(corr_target.item())
         metrics['stereo_corr_pred'] = float(corr_pred.item())
         metrics['stereo_corr_diff'] = float(abs(corr_target - corr_pred).item())
+
+        # M/S ratio metrics
+        ms_target = ms_ratio(target)
+        ms_pred = ms_ratio(pred)
+        metrics['ms_ratio_target'] = float(ms_target.item())
+        metrics['ms_ratio_pred'] = float(ms_pred.item())
+        metrics['ms_ratio_diff'] = float(abs(ms_target - ms_pred).item())
 
     return metrics
