@@ -14,7 +14,6 @@ from lycodec.utils.losses import (
     residual_loss,
     alignment_loss,
     summary_contrast_loss,
-    stereo_corr_loss,
 )
 from lycodec.utils.audio import stereo_metrics_inline
 
@@ -220,119 +219,90 @@ def train(cfg_path, data_root):
 
     for epoch in range(cfg["epochs"]):
         model.train()
+
+        # Create EMA teacher once per epoch (GPU-resident, updated after each optimizer step)
+        ema_teacher = None
+        use_ema_teacher = cfg["train"].get("use_ema_teacher", True)
+        if use_ema_teacher and ema is not None:
+            import copy
+            ema_teacher = copy.deepcopy(accelerator.unwrap_model(model))
+            ema_teacher.to(accelerator.device)
+            ema.copy_to(ema_teacher)
+            ema_teacher.eval()
+            if accelerator.is_main_process:
+                print(f"[Epoch {epoch}] Created EMA teacher on device {accelerator.device}")
+
         pbar = tqdm(dl, desc=f"epoch {epoch}")
         for wav in pbar:
             # Calculate scheduled weights
             alignment_weight = get_scheduled_weight(cfg["train"].get("alignment_weight_schedule", []), total_steps)
             contrast_weight = get_scheduled_weight(cfg["train"].get("contrast_weight_schedule", []), total_steps)
-            stereo_corr_weight = get_scheduled_weight(cfg["train"].get("stereo_corr_weight_schedule", []), total_steps)
             residual_weight = get_scheduled_weight(cfg["train"].get("residual_weight_schedule", []), total_steps)
 
             with accelerator.accumulate(model):
                 model_obj = accelerator.unwrap_model(model)
 
-                # MEMORY OPTIMIZATION: decode=False to skip unnecessary reconstruction
+                # MEMORY OPTIMIZATION: decode=False to skip reconstruction during training
                 with accelerator.autocast():
-                    rec = None
                     _, enc = model(wav, decode=False)
 
                 loss = torch.zeros((), device=accelerator.device)
 
-                # MEMORY OPTIMIZATION: EMA teacher on CPU, only move to GPU per microbatch
-                ema_teacher_cpu = None
-                teacher_fn = None
-                use_ema_teacher = cfg["train"].get("use_ema_teacher", True)
-                if use_ema_teacher and ema is not None:
-                    import copy
-                    # Keep EMA teacher on CPU to save GPU memory
-                    ema_teacher_cpu = copy.deepcopy(model_obj).cpu()
-                    ema.copy_to(ema_teacher_cpu)
-                    ema_teacher_cpu.eval()
-
-                    # Custom teacher function: move to GPU only for microbatch decode
-                    def teacher_decode_fn(tokens, length, sigma, spec_noisy, chunk=1):
-                        outs = []
-                        for i in range(0, tokens.size(0), chunk):
-                            # Move teacher to GPU temporarily
-                            ema_teacher_gpu = ema_teacher_cpu.to(accelerator.device, non_blocking=True)
-                            with torch.no_grad():
-                                outs.append(
-                                    ema_teacher_gpu.decode(
-                                        tokens[i:i+chunk], length,
-                                        sigma[i:i+chunk], spec_noisy[i:i+chunk]
-                                    )
-                                )
-                            # Clean up immediately
-                            del ema_teacher_gpu
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        return torch.cat(outs, dim=0)
-
-                    teacher_fn = teacher_decode_fn
-
-                # OPTIMIZATION: Request student prediction for reuse (saves 1 decode = ~20-30% peak memory)
-                rec = None
+                # Consistency loss (EMA teacher already created and GPU-resident)
                 with accelerator.autocast():
-                    if stereo_corr_weight > 0:
-                        # Reuse student prediction from consistency_loss
-                        loss_consistency, rec = consistency_loss(
-                            model_obj, wav, enc["tokens"], enc["spec_clean"],
-                            sigma_min=cfg["train"].get("sigma_min", 0.002),
-                            sigma_max=cfg["train"].get("sigma_max", 80.0),
-                            rho=cfg["train"].get("rho", 7.0),
-                            ema_model=None,  # Not used when teacher_fn is provided
-                            decode_chunk=cfg["train"].get("decode_chunk", 1),
-                            teacher_fn=teacher_fn,
-                            return_student_pred=True,  # OPTIMIZATION: return student for reuse
-                        )
-                    else:
-                        loss_consistency = consistency_loss(
-                            model_obj, wav, enc["tokens"], enc["spec_clean"],
-                            sigma_min=cfg["train"].get("sigma_min", 0.002),
-                            sigma_max=cfg["train"].get("sigma_max", 80.0),
-                            rho=cfg["train"].get("rho", 7.0),
-                            ema_model=None,
-                            decode_chunk=cfg["train"].get("decode_chunk", 1),
-                            teacher_fn=teacher_fn,
-                        )
-
-                # Clean up EMA teacher CPU copy
-                if ema_teacher_cpu is not None:
-                    del ema_teacher_cpu
+                    loss_consistency = consistency_loss(
+                        model_obj, wav, enc["tokens"], enc["spec_clean"],
+                        sigma_min=cfg["train"].get("sigma_min", 0.002),
+                        sigma_max=cfg["train"].get("sigma_max", 80.0),
+                        rho=cfg["train"].get("rho", 7.0),
+                        ema_model=ema_teacher,  # GPU-resident teacher, no CPU↔GPU hop
+                        decode_chunk=cfg["train"].get("decode_chunk", 1),
+                        teacher_fn=None,
+                    )
                 loss = loss + loss_consistency
-
-                # Stereo correlation loss (OPTIMIZATION: reuse student prediction, no extra decode!)
-                loss_stereo_corr = None
-                if stereo_corr_weight > 0 and rec is not None:
-                    # Use finer chunk size (1024 ≈ 23ms) for stronger local gradients
-                    loss_stereo_corr = stereo_corr_loss(wav, rec, chunk=1024)
-                    loss = loss + stereo_corr_weight * loss_stereo_corr
 
                 # Quantizer losses
                 loss_entropy_bonus = None
 
-                # Commitment loss (increased weight for stability)
-                if "commitment_loss" in enc:
-                    loss = loss + enc["commitment_loss"]  # Already weighted inside quantizer (0.5)
-
-                # Entropy bonus (only in early training, computed in quantizer forward)
+                # Entropy bonus (warmup only, decays to 0)
+                # Used for initial codebook diversity, then gradually removed
                 if "entropy_bonus" in enc:
                     loss_entropy_bonus = enc["entropy_bonus"]
-                    loss = loss + loss_entropy_bonus
+                    # Warmup: full weight until 5000 steps, then linear decay to 0 by 20000 steps
+                    warmup_end = 5000
+                    decay_end = 20000
+                    if total_steps < warmup_end:
+                        entropy_weight = 1.0
+                    elif total_steps < decay_end:
+                        entropy_weight = 1.0 - (total_steps - warmup_end) / (decay_end - warmup_end)
+                    else:
+                        entropy_weight = 0.0
+                    loss = loss + entropy_weight * loss_entropy_bonus
 
                 # Orthogonal regularization for OPQ-PQ
                 ortho_loss = enc.get("ortho_loss", None)
                 if ortho_loss is not None:
                     loss = loss + ortho_loss
 
-                # Residual loss (scheduled activation, only when not using dropout)
+                # Residual loss (sample-level, only for discrete path samples)
                 loss_residual = None
                 loss_align = None
                 if hasattr(model_obj, 'corrector') and model_obj.corrector is not None:
-                    if residual_weight > 0 and not enc.get("dropout_applied", False):
-                        if enc.get("r_target") is not None and enc.get("r_hat") is not None:
+                    if residual_weight > 0 and enc.get("r_target") is not None and enc.get("r_hat") is not None:
+                        dropout_mask = enc.get("dropout_applied", None)
+                        if dropout_mask is None:
+                            # No dropout, all samples use discrete path
                             loss_residual = residual_loss(enc["r_hat"], enc["r_target"])
-                            loss = loss + residual_weight * loss_residual
+                        else:
+                            # Sample-level: only compute for discrete path samples
+                            discrete_mask = (~dropout_mask.squeeze(-1).squeeze(-1)).float()  # [B]
+                            if discrete_mask.sum() > 0:
+                                # MSE per sample, then weighted average
+                                loss_per_sample = (enc["r_hat"] - enc["r_target"]).pow(2).mean(dim=(-1, -2))  # [B]
+                                loss_residual = (loss_per_sample * discrete_mask).sum() / (discrete_mask.sum() + 1e-6)
+                            else:
+                                loss_residual = torch.zeros((), device=accelerator.device)
+                        loss = loss + residual_weight * loss_residual
 
                 # Alignment loss (scheduled activation for discrete/continuous alignment)
                 if alignment_weight > 0 and enc.get("alignment_target") is not None and enc.get("y_disc") is not None:
@@ -351,19 +321,32 @@ def train(cfg_path, data_root):
                     loss = loss + contrast_weight * loss_contrast
 
                 accelerator.backward(loss)
-                # Gradient clipping using torch directly (not accelerator.clip_grad_norm_)
-                # to avoid conflicts with gradient accumulation context
+                # Gradient clipping (only when actually updating)
                 if grad_clip and accelerator.sync_gradients:
-                    # Only clip when we're about to update (not during accumulation)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 opt.step()
                 opt.zero_grad()
 
-                if ema is not None:
-                    ema.update(accelerator.unwrap_model(model))
-                total_steps += 1
+                # Update EMA and step counter only on actual optimizer updates
+                # (not during gradient accumulation microbatches)
+                if accelerator.sync_gradients:
+                    if ema is not None:
+                        ema.update(accelerator.unwrap_model(model))
+                        # Sync EMA weights to teacher for next batch
+                        if ema_teacher is not None:
+                            ema.copy_to(ema_teacher)
+                    total_steps += 1
 
-            # Enhanced wandb logging with detailed metrics (log every step from step 0)
+            # Clean up references (always, even during accumulation)
+            del enc, loss_consistency, loss_residual, loss_align, loss_contrast
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Logging and checkpointing only on actual updates (not microbatches)
+            if not accelerator.sync_gradients:
+                continue
+
+            # Enhanced wandb logging with detailed metrics
             if cfg["logging"]["use_wandb"] and accelerator.is_main_process:
                 try:
                     import wandb
@@ -372,14 +355,11 @@ def train(cfg_path, data_root):
                         "train/loss_consistency": float(loss_consistency.item()),
                         "train/alignment_weight": alignment_weight,
                         "train/contrast_weight": contrast_weight,
-                        "train/stereo_corr_weight": stereo_corr_weight,
                         "train/residual_weight": residual_weight,
                         "step": total_steps,
                     }
 
                     # Individual losses
-                    if loss_stereo_corr is not None:
-                        log["train/loss_stereo_corr"] = float(loss_stereo_corr.item())
                     if loss_align is not None:
                         log["train/loss_align"] = float(loss_align.item())
                     if loss_contrast is not None:
@@ -388,8 +368,6 @@ def train(cfg_path, data_root):
                         log["train/loss_residual"] = float(loss_residual.item())
 
                     # Quantizer metrics
-                    if "commitment_loss" in enc:
-                        log["quantizer/commitment_loss"] = float(enc["commitment_loss"].item())
                     if "entropy_bonus" in enc and enc["entropy_bonus"].item() != 0:
                         log["quantizer/entropy_bonus"] = float(enc["entropy_bonus"].item())
                     if "perplexity" in enc:
@@ -398,8 +376,9 @@ def train(cfg_path, data_root):
                         log["quantizer/usage_entropy"] = float(enc["usage_entropy"])
                     if "drop_prob" in enc:
                         log["quantizer/drop_prob"] = float(enc["drop_prob"])
-                    if "dropout_applied" in enc:
-                        log["quantizer/dropout_applied"] = int(enc["dropout_applied"])
+                    if "dropout_applied" in enc and enc["dropout_applied"] is not None:
+                        # dropout_applied is now a tensor [B,1,1], log ratio of samples using continuous path
+                        log["quantizer/dropout_ratio"] = float(enc["dropout_applied"].float().mean().item())
                     if "active_codes" in enc:
                         log["quantizer/active_codes"] = int(enc["active_codes"])
                     if "current_tau" in enc:
@@ -412,11 +391,14 @@ def train(cfg_path, data_root):
                         log["train/loss_residual"] = float(loss_residual.item())
 
                     # Audio metrics (only occasionally to save time)
-                    if rec is not None and total_steps % 10 == 0:
+                    if total_steps % 100 == 0:
                         try:
-                            m = stereo_metrics_inline(wav, rec.detach())
+                            with torch.no_grad():
+                                rec = model_obj.decode(enc["tokens"], wav.shape[-1])
+                            m = stereo_metrics_inline(wav, rec)
                             for k, v in m.items():
                                 log[f"audio/{k}"] = v
+                            del rec
                         except Exception:
                             pass
 
@@ -436,10 +418,7 @@ def train(cfg_path, data_root):
                     ckpt_data["ema_shadow"] = ema.shadow
                 save_ckpt(ckpt_data, os.path.join(cfg["output"]["ckpt_dir"], f"step_{total_steps}.pt"))
 
-            # Clean up references for better memory management (after logging)
-            del enc, rec, loss_consistency, loss_stereo_corr, loss_residual, loss_align, loss_contrast
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Update progress bar
             pbar.set_postfix({"loss": float(loss.item()), "step": total_steps})
 
     if ema is not None and accelerator.is_main_process:
@@ -456,15 +435,38 @@ def train(cfg_path, data_root):
         save_ckpt(ckpt_data, os.path.join(cfg["output"]["ckpt_dir"], "latest.pt"))
 
 
-def load_model(ckpt_path, cfg_path):
+def load_model(ckpt_path, cfg_path, use_ema=True):
+    """
+    Load model from checkpoint.
+
+    Args:
+        ckpt_path: path to checkpoint file
+        cfg_path: path to config file
+        use_ema: if True, load EMA weights for inference (recommended)
+    """
     cfg = load_config(cfg_path)
     model = build_model_from_config(cfg)
     if ckpt_path and os.path.exists(ckpt_path):
-        sd = torch.load(ckpt_path, map_location="cpu")["model"]
-        from collections import OrderedDict
-        new_sd = OrderedDict()
-        for k, v in sd.items():
-            name = k.replace("module.", "") if k.startswith("module.") else k
-            new_sd[name] = v
-        model.load_state_dict(new_sd, strict=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+
+        # Load EMA weights if available and requested
+        if use_ema and "ema_shadow" in ckpt:
+            print(f"[load_model] Loading EMA weights from {ckpt_path}")
+            ema_shadow = ckpt["ema_shadow"]
+            # Apply EMA shadow to model parameters
+            with torch.no_grad():
+                for n, p in model.named_parameters():
+                    if n in ema_shadow:
+                        p.data.copy_(ema_shadow[n])
+        else:
+            # Load regular model weights
+            if use_ema and "ema_shadow" not in ckpt:
+                print(f"[load_model] Warning: EMA weights not found in {ckpt_path}, using model weights")
+            sd = ckpt["model"]
+            from collections import OrderedDict
+            new_sd = OrderedDict()
+            for k, v in sd.items():
+                name = k.replace("module.", "") if k.startswith("module.") else k
+                new_sd[name] = v
+            model.load_state_dict(new_sd, strict=False)
     return model

@@ -2,6 +2,18 @@ import torch
 import torch.nn.functional as F
 
 
+# Global cache for STFT/ISTFT windows to avoid repeated allocations
+_hann_window_cache = {}
+
+
+def _get_hann_window(win_length, device):
+    """Get cached Hann window or create new one."""
+    key = (win_length, device.type, device.index if device.type == 'cuda' else None)
+    if key not in _hann_window_cache:
+        _hann_window_cache[key] = torch.hann_window(win_length, device=device, dtype=torch.float32)
+    return _hann_window_cache[key]
+
+
 def to_midside(x):
     l, r = x[:, 0:1], x[:, 1:2]
     m = (l + r) * 0.5
@@ -31,7 +43,7 @@ def stft(x, n_fft=2048, hop_length=640, win_length=2048):
 
     # Force float32 for STFT to avoid fp16 issues in AMP
     x32 = x.float()
-    win = torch.hann_window(win_length, device=x.device, dtype=torch.float32)
+    win = _get_hann_window(win_length, x.device)
     X = torch.stft(x32, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
                    window=win, return_complex=True, center=True, pad_mode="reflect")
 
@@ -55,7 +67,7 @@ def istft(X, n_fft=2048, hop_length=640, win_length=2048, length=None):
         X = X.reshape(b * c, f, t)
 
     # Force float32 for ISTFT
-    win = torch.hann_window(win_length, device=X.device, dtype=torch.float32)
+    win = _get_hann_window(win_length, X.device)
     x = torch.istft(X, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
                     window=win, length=length, center=True)
 

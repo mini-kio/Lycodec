@@ -64,4 +64,10 @@ class StereoCropDataset(Dataset):
         seg = x[start:start + self.len]
         seg = seg.T  # [C, T]
 
+        # Stereo jitter augmentation: micro-delays to encourage phase coherence learning
+        # 30% chance to apply 0.1-0.2ms delay to left channel (~4 samples at 44.1kHz)
+        if random.random() < 0.3:
+            delay = random.randint(-4, 4)
+            seg[0] = torch.roll(seg[0], delay, dims=-1)
+
         return seg

@@ -159,12 +159,16 @@ class Lycodec(nn.Module):
         if current_step < warmup_steps:
             drop_prob = 0.0  # Force discrete path during warmup
 
-        dropout_applied = False
+        # Sample-level dropout (not batch-level) to prevent residual_loss starvation
+        dropout_mask = None
         tokens_for_decoder = y_disc_corrected
         if self.training and drop_prob > 0.0:
-            if torch.rand(1, device=tokens_for_decoder.device).item() < drop_prob:
-                tokens_for_decoder = y_cont
-                dropout_applied = True
+            b = y_disc_corrected.size(0)
+            # Bernoulli mask: True = use continuous, False = use discrete
+            dropout_mask = (torch.rand(b, device=y_disc_corrected.device) < drop_prob).view(b, 1, 1)
+            tokens_for_decoder = torch.where(dropout_mask, y_cont, y_disc_corrected)
+
+        dropout_applied = dropout_mask  # Now a tensor [B,1,1] or None
 
         # Use corrected path for discrete summary to ensure gradient flow
         summary_disc = self._summary_head(y_disc_corrected)
@@ -174,7 +178,6 @@ class Lycodec(nn.Module):
         return {
             "tokens": tokens_for_decoder,
             "indices": quant_out['indices'],
-            "commitment_loss": quant_out['commitment_loss'],
             "entropy_bonus": quant_out.get('entropy_bonus', torch.tensor(0.0, device=z_continuous.device)),
             "ortho_loss": quant_out.get('ortho_loss', torch.tensor(0.0, device=z_continuous.device)),
             "perplexity": quant_out['perplexity'],
@@ -225,6 +228,16 @@ class Lycodec(nn.Module):
 
     def forward(self, wav, decode=True):
         """Run full codec pass returning reconstruction and encoder artifacts."""
+        # Mid/Side RMS normalization (training only)
+        # Balances M/S energy to prevent stereo collapse without explicit stereo_corr_loss
+        if self.training:
+            from lycodec.utils.audio import to_midside, to_stereo
+            ms = to_midside(wav)
+            m, s = ms[:, 0], ms[:, 1]
+            # Scale side to match mid RMS
+            s = s * (m.abs().mean() / (s.abs().mean() + 1e-6))
+            wav = to_stereo(torch.stack([m, s], dim=1))
+
         spec_clean = wav_to_spec(wav, self.n_fft, self.hop, self.win)
         enc = self.encode(spec=spec_clean)
         rec = self.decode(enc["tokens"], wav.shape[-1]) if decode else None
