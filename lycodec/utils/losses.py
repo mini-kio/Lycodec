@@ -3,9 +3,7 @@ import torch.nn.functional as F
 import math
 
 
-# ============================================================================
-# Utility Functions
-# ============================================================================
+# Utility helpers
 
 def safe_loss_device(*tensors):
     """Extract device from first valid tensor, otherwise return 'cpu'."""
@@ -20,9 +18,7 @@ def validate_tensors(*tensors):
     return all(isinstance(t, torch.Tensor) for t in tensors)
 
 
-# ============================================================================
-# Loss Functions
-# ============================================================================
+# Loss functions
 
 def sample_noise_levels(batch_size, device, sigma_min=0.002, sigma_max=80.0, rho=7.0):
     """Sample noise levels from log-normal distribution (EDM schedule)."""
@@ -95,7 +91,7 @@ def consistency_loss(model, wav, tokens, spec_clean, sigma_min=0.002, sigma_max=
     loss = pseudo_huber_loss(pred_i_plus, pred_i, c=c)
     loss = loss / (delta_sigma.mean() + 1e-8)
 
-    # OPTIMIZATION: Return student prediction for reuse (stereo loss, metrics, etc.)
+    # OPTIMIZATION: Return student prediction for reuse (metrics, etc.)
     if return_student_pred:
         return loss, pred_i_plus.detach()  # detach to avoid holding computation graph
     return loss
@@ -119,73 +115,16 @@ def alignment_loss(y_disc, y_cont_detached):
     y_cont_norm = F.normalize(y_cont_detached, dim=-1)
     return 1 - (y_disc_norm * y_cont_norm).sum(dim=-1).mean()
 
-def stereo_corr_loss(target, pred, chunk=2048):
-    """
-    Enhanced stereo loss combining frame-wise correlation and M/S energy ratio.
-
-    Args:
-        target: target waveform [B, 2, T]
-        pred: predicted waveform [B, 2, T]
-        chunk: frame size for correlation computation (default 2048 ≈ 46ms at 44.1kHz)
-
-    Returns:
-        combined loss: 0.7 * frame_corr_diff + 0.3 * ms_ratio_diff
-    """
-    def _chunk_corr(x, chunk_size):
-        """Compute frame-wise L/R correlation; keep batch dim [B]."""
-        if x.shape[1] != 2:
-            return torch.zeros((x.shape[0],), device=x.device)  # [B]
-        B, C, T = x.shape
-        # Protect against T < chunk_size
-        if T < chunk_size:
-            chunk_size = T
-        T2 = (T // chunk_size) * chunk_size
-        x = x[..., :T2].reshape(B, C, -1, chunk_size)  # [B, 2, N, chunk]
-        l, r = x[:, 0], x[:, 1]  # [B, N, chunk]
-        # Center each frame
-        l = l - l.mean(dim=-1, keepdim=True)
-        r = r - r.mean(dim=-1, keepdim=True)
-        # Correlation per frame
-        num = (l * r).sum(dim=-1)  # [B, N]
-        den = (l.pow(2).sum(dim=-1) * r.pow(2).sum(dim=-1)).sqrt() + 1e-8
-        # Average over frames only, keep batch dim
-        return (num / den).mean(dim=-1)  # [B]
-
-    def _ms_ratio(x):
-        """Return M/S energy ratio per sample [B] (no batch mean here)."""
-        if x.shape[1] != 2:
-            return torch.zeros((x.shape[0],), device=x.device)  # [B]
-        M = (x[:, 0] + x[:, 1]) * 0.5  # Mid
-        S = (x[:, 0] - x[:, 1]) * 0.5  # Side
-        eM = M.pow(2).mean(dim=-1)  # [B]
-        eS = S.pow(2).mean(dim=-1)  # [B]
-        # Side energy ratio, keep batch dim
-        return eS / (eM + eS + 1e-8)  # [B]
-
-    # Frame-wise correlation difference
-    corr_t = _chunk_corr(target, chunk)  # [B]
-    corr_p = _chunk_corr(pred, chunk)    # [B]
-    loss_corr = (corr_t - corr_p).abs().mean()  # batch mean here
-
-    # M/S energy ratio difference
-    ms_t = _ms_ratio(target)  # [B]
-    ms_p = _ms_ratio(pred)    # [B]
-    loss_ms = (ms_t - ms_p).abs().mean()  # batch mean here
-
-    # Blend: prioritize correlation, add MS ratio for anti-mono-collapse
-    return 0.7 * loss_corr + 0.3 * loss_ms
-
-def summary_contrast_loss(summary_a, summary_b, temperature=0.07, gather_fn=None):
+def summary_contrast_loss(summary_a, summary_b, temperature=0.07, gather_fn=None, rank=None):
     """
     InfoNCE contrastive loss with distributed support.
-
-    FIXED: Gather is now wrapped in no_grad() to prevent autograd warnings.
 
     Args:
         summary_a: query features [B, D] (gradients flow)
         summary_b: key features [B, D] (target, detached)
         temperature: softmax temperature
         gather_fn: optional function to gather features across GPUs (e.g., accelerator.gather)
+        rank: current process rank for distributed training (optional, required for correct labels)
     """
     if summary_a is None or summary_b is None:
         return torch.zeros((), device=summary_a.device if summary_a is not None else summary_b.device)
@@ -203,8 +142,13 @@ def summary_contrast_loss(summary_a, summary_b, temperature=0.07, gather_fn=None
                 summary_b_all = gather_fn(summary_b)
             # Use local query, global keys
             logits = summary_a @ summary_b_all.t() / temperature
-            # Labels: local batch indices (assumes same batch size across ranks)
-            labels = torch.arange(summary_a.size(0), device=summary_a.device)
+            # Labels: local batch indices + rank offset for correct positive pair matching
+            B_local = summary_a.size(0)
+            if rank is not None:
+                labels = torch.arange(B_local, device=summary_a.device) + rank * B_local
+            else:
+                # Fallback: assume rank 0 (will be incorrect for multi-GPU, but prevents crash)
+                labels = torch.arange(B_local, device=summary_a.device)
         except:
             # Fallback to local batch if gathering fails
             logits = summary_a @ summary_b.t() / temperature

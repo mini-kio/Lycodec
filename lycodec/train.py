@@ -1,16 +1,17 @@
 import os
 import copy
+import time
 import yaml
 from tqdm import tqdm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 from lycodec.data import StereoCropDataset
 from lycodec.model import Lycodec
 from lycodec.utils.losses import (
-    consistency_loss,
     residual_loss,
     alignment_loss,
     summary_contrast_loss,
@@ -25,13 +26,20 @@ def load_config(path):
 
 def build_model_from_config(cfg):
     """Build Lycodec model from configuration dictionary."""
+    import math
 
-    # Calculate token_fps: tokens per second (Hz)
-    # NOTE: Model internally uses this as sequence length for training clips
-    # e.g., 24 Hz * 1.5s = 36 tokens/clip, but we still call it "fps" (frequency)
-    token_fps_hz = cfg["model"].get("token_fps", 24)  # tokens per second (Hz)
+    # Separate token rate (Hz) from sequence length (tokens/clip)
+    token_rate_hz = cfg["model"].get("token_rate_hz", 24)  # Frequency: tokens per second
     crop_seconds = cfg.get("crop_seconds", 1.5)
-    tokens_per_clip = int(token_fps_hz * crop_seconds)  # e.g., 24 * 1.5 = 36
+    train_seq_len = int(token_rate_hz * crop_seconds)  # Sequence length: e.g., 24 * 1.5 = 36
+
+    # Compute decoder spectrogram time frames
+    # STFT with center=True: n_frames = ceil(wav_length / hop_length)
+    sr = cfg["sample_rate"]
+    n_fft = cfg["stft"]["n_fft"]
+    hop_length = cfg["stft"]["hop_length"]
+    wav_length = int(crop_seconds * sr)
+    decoder_t_frames = math.ceil(wav_length / hop_length)
 
     ema_decay = cfg["model"].get("ema_decay", 0.97)
     awakening_steps = cfg["model"].get("awakening_steps", 200)
@@ -42,9 +50,9 @@ def build_model_from_config(cfg):
     pq_K = cfg["model"].get("pq_K", 256)
 
     model = Lycodec(
-        sr=cfg["sample_rate"],
-        n_fft=cfg["stft"]["n_fft"],
-        hop=cfg["stft"]["hop_length"],
+        sr=sr,
+        n_fft=n_fft,
+        hop=hop_length,
         win=cfg["stft"]["win_length"],
         token_dim=cfg["model"]["token_dim"],
         hidden=cfg["model"]["hidden_dim"],
@@ -61,7 +69,9 @@ def build_model_from_config(cfg):
         pq_K=pq_K,
         ema_decay=ema_decay,
         awakening_steps=awakening_steps,
-        token_fps=tokens_per_clip,  # tokens per second (frequency), passed as clip length
+        token_rate_hz=token_rate_hz,    # 24 Hz (frequency)
+        train_seq_len=train_seq_len,    # 36 tokens/clip (sequence length)
+        decoder_t_frames=decoder_t_frames,  # Spectrogram time frames
         drop_start=drop_start,
         drop_end=drop_end,
         drop_decay_steps=drop_decay_steps,
@@ -73,6 +83,20 @@ def build_model_from_config(cfg):
     quantizer_warmup = cfg["train"].get("quantizer_warmup_steps", 5000)
     model.quantizer_warmup_steps = quantizer_warmup
 
+    # Enhanced logging
+    bits_per_token = pq_M * math.log2(pq_K)
+    bitrate_bps = token_rate_hz * bits_per_token
+    print("=" * 80)
+    print(f"[Lycodec Config Summary]")
+    print(f"  Token Rate:        {token_rate_hz} Hz (tokens per second)")
+    print(f"  Train Seq Length:  {train_seq_len} tokens ({crop_seconds}s clips)")
+    print(f"  Decoder T-Frames:  {decoder_t_frames} (spectrogram time frames)")
+    print(f"  PQ Config:         M={pq_M} subspaces × K={pq_K} codes")
+    print(f"  Bits per Token:    {bits_per_token:.1f} bits ({pq_M}×log₂{pq_K})")
+    print(f"  Bitrate:           {bitrate_bps:.0f} bps ({bitrate_bps/1000:.2f} kbps)")
+    print(f"  Corrector:         {'Enabled' if cfg['model'].get('use_residual_corrector', True) else 'Disabled'} (α={cfg['model'].get('corrector_alpha', 0.3)})")
+    print("=" * 80)
+
     return model
 
 
@@ -81,6 +105,45 @@ def save_ckpt(state, path):
     if d:
         os.makedirs(d, exist_ok=True)
     torch.save(state, path)
+
+
+def find_latest_checkpoint(ckpt_dir):
+    """
+    Find the latest checkpoint in the checkpoint directory.
+
+    Args:
+        ckpt_dir: directory containing checkpoints (e.g., "runs/ckpts")
+
+    Returns:
+        path to latest checkpoint (e.g., "runs/ckpts/step_52000.pt"), or None if no checkpoints found
+    """
+    if not os.path.exists(ckpt_dir):
+        return None
+
+    # Find all step_*.pt files
+    import glob
+    ckpt_files = glob.glob(os.path.join(ckpt_dir, "step_*.pt"))
+
+    if not ckpt_files:
+        return None
+
+    # Extract step numbers and find the latest
+    step_numbers = []
+    for ckpt_file in ckpt_files:
+        basename = os.path.basename(ckpt_file)  # e.g., "step_52000.pt"
+        if basename.startswith("step_") and basename.endswith(".pt"):
+            try:
+                step_num = int(basename[5:-3])  # extract "52000" from "step_52000.pt"
+                step_numbers.append((step_num, ckpt_file))
+            except ValueError:
+                continue
+
+    if not step_numbers:
+        return None
+
+    # Return the checkpoint with the highest step number
+    latest_step, latest_ckpt = max(step_numbers, key=lambda x: x[0])
+    return latest_ckpt
 
 
 class EMA:
@@ -96,13 +159,21 @@ class EMA:
     def update(self, model):
         for n, p in model.named_parameters():
             if n in self.shadow and p.requires_grad and p.dtype.is_floating_point:
+                # Ensure shadow is on the same device as parameter (for multi-GPU)
+                if self.shadow[n].device != p.device:
+                    self.shadow[n] = self.shadow[n].to(p.device)
                 self.shadow[n].mul_(self.decay).add_(p, alpha=1 - self.decay)
 
     @torch.no_grad()
     def copy_to(self, model):
         for n, p in model.named_parameters():
             if n in self.shadow:
-                p.data.copy_(self.shadow[n])
+                # Ensure shadow is on the same device as parameter (for multi-GPU)
+                if self.shadow[n].device != p.device:
+                    shadow_data = self.shadow[n].to(p.device)
+                else:
+                    shadow_data = self.shadow[n]
+                p.data.copy_(shadow_data)
 
 
 
@@ -116,10 +187,22 @@ def train(cfg_path, data_root):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    # Enable cuDNN auto-tuner for optimal convolution algorithms
+    torch.backends.cudnn.benchmark = True
+
     grad_clip = cfg["train"].get("grad_clip", 1.0)
+
+    # DDP communication optimization
+    from accelerate.utils import DistributedDataParallelKwargs
+    ddp_kwargs = DistributedDataParallelKwargs(
+        bucket_cap_mb=75,  # Optimize bucket size for gradient communication
+        find_unused_parameters=False,  # Disable if all parameters are used
+    )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.get("train", {}).get("gradient_accumulation_steps", 1),
         mixed_precision="fp16" if cfg.get("train", {}).get("use_amp", False) else "no",
+        kwargs_handlers=[ddp_kwargs],
         # Gradient clipping handled by Accelerator when using accumulate()
     )
     sr = cfg["sample_rate"]
@@ -168,8 +251,18 @@ def train(cfg_path, data_root):
     total_steps = 0
     ema = EMA(accelerator.unwrap_model(model), decay=cfg["train"]["ema"].get("decay", 0.9999)) if cfg["train"]["ema"].get("enabled", False) else None
 
-    # Resume from checkpoint (if specified in config)
+    # Resume from checkpoint (auto-find latest or use specified path)
     resume_ckpt_path = cfg["output"].get("resume_ckpt")
+
+    # Auto-find latest checkpoint if "auto" or empty
+    if resume_ckpt_path == "auto" or not resume_ckpt_path:
+        ckpt_dir = cfg["output"].get("ckpt_dir", "runs/ckpts")
+        resume_ckpt_path = find_latest_checkpoint(ckpt_dir)
+        if resume_ckpt_path and accelerator.is_main_process:
+            print(f"[Auto-Resume] Found latest checkpoint: {resume_ckpt_path}")
+        elif accelerator.is_main_process:
+            print(f"[Auto-Resume] No checkpoints found in {ckpt_dir}, starting from scratch")
+
     if resume_ckpt_path and os.path.exists(resume_ckpt_path):
         sd = torch.load(resume_ckpt_path, map_location="cpu")
         # Load model state (including quantizer step_counter)
@@ -238,28 +331,26 @@ def train(cfg_path, data_root):
             alignment_weight = get_scheduled_weight(cfg["train"].get("alignment_weight_schedule", []), total_steps)
             contrast_weight = get_scheduled_weight(cfg["train"].get("contrast_weight_schedule", []), total_steps)
             residual_weight = get_scheduled_weight(cfg["train"].get("residual_weight_schedule", []), total_steps)
+            index_ce_weight = get_scheduled_weight(cfg["train"].get("index_ce_weight_schedule", []), total_steps)
+            min_index_ce_weight = cfg["train"].get("index_ce_min_weight", 1e-4)
+            bundle_align_weight = cfg["train"].get("bundle_align_weight", 1e-4)
 
             with accelerator.accumulate(model):
                 model_obj = accelerator.unwrap_model(model)
 
-                # MEMORY OPTIMIZATION: decode=False to skip reconstruction during training
+                # Single unified forward pass (encoder + decoder in one computational graph)
+                # This solves DDP "unused parameters" by including all modules
                 with accelerator.autocast():
-                    _, enc = model(wav, decode=False)
-
-                loss = torch.zeros((), device=accelerator.device)
-
-                # Consistency loss (EMA teacher already created and GPU-resident)
-                with accelerator.autocast():
-                    loss_consistency = consistency_loss(
-                        model_obj, wav, enc["tokens"], enc["spec_clean"],
+                    enc, loss_consistency = model(
+                        wav,
+                        ema_teacher=ema_teacher,
                         sigma_min=cfg["train"].get("sigma_min", 0.002),
                         sigma_max=cfg["train"].get("sigma_max", 80.0),
                         rho=cfg["train"].get("rho", 7.0),
-                        ema_model=ema_teacher,  # GPU-resident teacher, no CPU↔GPU hop
                         decode_chunk=cfg["train"].get("decode_chunk", 1),
-                        teacher_fn=None,
                     )
-                loss = loss + loss_consistency
+
+                loss = loss_consistency
 
                 # Quantizer losses
                 loss_entropy_bonus = None
@@ -314,11 +405,36 @@ def train(cfg_path, data_root):
                 if contrast_weight > 0 and enc.get("summary_disc") is not None and enc.get("summary_cont") is not None:
                     # Pass accelerator.gather for multi-GPU negative mining
                     gather_fn = accelerator.gather if accelerator.num_processes > 1 else None
+                    rank = accelerator.process_index if accelerator.num_processes > 1 else None
                     loss_contrast = summary_contrast_loss(
                         enc["summary_disc"], enc["summary_cont"],
-                        gather_fn=gather_fn
+                        gather_fn=gather_fn,
+                        rank=rank
                     )
                     loss = loss + contrast_weight * loss_contrast
+
+                # M-way index prediction CE loss (ensure gradients even during warmup)
+                loss_index_ce = None
+                eff_index_ce_weight = index_ce_weight if index_ce_weight > 0 else min_index_ce_weight
+                if eff_index_ce_weight > 0 and enc.get("logits_list") is not None:
+                    logits_list = enc["logits_list"]
+                    target_indices = enc["indices"]  # [B, T, M]
+
+                    # Compute CE for each subspace and average
+                    loss_index_ce = 0
+                    for m in range(len(logits_list)):
+                        logits_m = logits_list[m].reshape(-1, model_obj.pq_K)  # [B*T, K]
+                        target_m = target_indices[:, :, m].reshape(-1)  # [B*T]
+                        loss_index_ce += F.cross_entropy(logits_m, target_m)
+                    loss_index_ce /= len(logits_list)  # Average across M subspaces
+
+                    loss = loss + eff_index_ce_weight * loss_index_ce
+
+                # Bundle-token alignment keeps embedding tables participating in loss
+                loss_bundle_align = None
+                if bundle_align_weight > 0 and enc.get("bundle_tokens") is not None and enc.get("z_q") is not None:
+                    loss_bundle_align = F.mse_loss(enc["bundle_tokens"], enc["z_q"].detach())
+                    loss = loss + bundle_align_weight * loss_bundle_align
 
                 accelerator.backward(loss)
                 # Gradient clipping (only when actually updating)
@@ -330,20 +446,22 @@ def train(cfg_path, data_root):
                 # Update EMA and step counter only on actual optimizer updates
                 # (not during gradient accumulation microbatches)
                 if accelerator.sync_gradients:
+                    # Sync quantizer step counter to optimizer steps
+                    model_unwrapped = accelerator.unwrap_model(model)
+                    with torch.no_grad():
+                        model_unwrapped.quantizer.step_counter.fill_(total_steps)
+
                     if ema is not None:
-                        ema.update(accelerator.unwrap_model(model))
+                        ema.update(model_unwrapped)
                         # Sync EMA weights to teacher for next batch
                         if ema_teacher is not None:
                             ema.copy_to(ema_teacher)
                     total_steps += 1
 
-            # Clean up references (always, even during accumulation)
-            del enc, loss_consistency, loss_residual, loss_align, loss_contrast
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
             # Logging and checkpointing only on actual updates (not microbatches)
             if not accelerator.sync_gradients:
+                # Clean up before continuing (gradient accumulation microbatch)
+                del enc, loss_consistency, loss_residual, loss_align, loss_contrast, loss_index_ce, loss_bundle_align
                 continue
 
             # Enhanced wandb logging with detailed metrics
@@ -356,6 +474,9 @@ def train(cfg_path, data_root):
                         "train/alignment_weight": alignment_weight,
                         "train/contrast_weight": contrast_weight,
                         "train/residual_weight": residual_weight,
+                        "train/index_ce_weight": index_ce_weight,
+                        "train/index_ce_weight_effective": eff_index_ce_weight,
+                        "train/bundle_align_weight": bundle_align_weight,
                         "step": total_steps,
                     }
 
@@ -366,6 +487,10 @@ def train(cfg_path, data_root):
                         log["train/loss_contrast"] = float(loss_contrast.item())
                     if loss_residual is not None:
                         log["train/loss_residual"] = float(loss_residual.item())
+                    if loss_index_ce is not None:
+                        log["train/loss_index_ce"] = float(loss_index_ce.item())
+                    if loss_bundle_align is not None:
+                        log["train/loss_bundle_align"] = float(loss_bundle_align.item())
 
                     # Quantizer metrics
                     if "entropy_bonus" in enc and enc["entropy_bonus"].item() != 0:
@@ -420,6 +545,9 @@ def train(cfg_path, data_root):
 
             # Update progress bar
             pbar.set_postfix({"loss": float(loss.item()), "step": total_steps})
+
+            # Clean up after logging/checkpointing
+            del enc, loss_consistency, loss_residual, loss_align, loss_contrast, loss_index_ce, loss_bundle_align
 
     if ema is not None and accelerator.is_main_process:
         model_to_save = accelerator.unwrap_model(model)

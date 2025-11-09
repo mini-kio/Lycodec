@@ -6,9 +6,7 @@ from lycodec.utils.audio import resample_time
 from lycodec.core.blocks import ConvNormAct2d, ConvTransposeNormAct2d
 
 
-# ============================================================================
-# Utility Functions
-# ============================================================================
+# Utility helpers
 
 def to_tensor(value, batch_size=None, device='cpu', dtype=torch.float32):
     """Convert value to tensor if not already a tensor."""
@@ -91,7 +89,8 @@ class TokenConditioner(nn.Module):
 
         # Add noise conditioning if provided
         if sigma is not None:
-            sigma_tensor = to_tensor(sigma, device=z.device)
+            sigma_tensor = to_tensor(sigma, batch_size=b, device=z.device, dtype=torch.float32)
+            sigma_tensor = sigma_tensor.reshape(b).contiguous()
             c_noise = compute_noise_embedding(sigma_tensor, reshape=True)  # [B, 1]
             noise_emb = self.noise_embed(c_noise)  # [B, C]
             noise_emb = noise_emb.view(b, -1, 1, 1).expand(-1, -1, self.f_bins, self.t_out)
@@ -170,9 +169,7 @@ class BandSplitHead(nn.Module):
         return out
 
 
-# ============================================================================
-# Transformer-based Decoder Components
-# ============================================================================
+# Transformer-based decoder components
 
 class AdaptiveLayerNorm(nn.Module):
     """

@@ -5,9 +5,7 @@ import math
 from lycodec.utils.audio import resample_time
 
 
-# ============================================================================
-# Common Neural Network Building Blocks
-# ============================================================================
+# Common neural network building blocks
 
 class ConvNormAct2d(nn.Module):
     """Conv2d -> GroupNorm -> SiLU activation block."""
@@ -102,9 +100,7 @@ class ConvTransposeNormAct2d(nn.Module):
         return self.net(x)
 
 
-# ============================================================================
-# Encoder Components
-# ============================================================================
+# Encoder components
 
 class ConvBlock2d(nn.Module):
     def __init__(self, c_in, c_out, stride=(1, 1)):
@@ -576,10 +572,8 @@ class OPQPQQuantizer(nn.Module):
             if step > 0 and step % self.qr_every == 0:
                 self.apply_qr_decomposition()
 
-        # Increment step counter
-        if training:
-            with torch.no_grad():
-                self.step_counter += 1
+        # NOTE: step_counter is now incremented externally in train loop
+        # to sync with optimizer steps (not forward passes)
 
         drop_prob = self._current_drop_prob() if training else 0.0
         active_codes = sum(active_codes_list) / len(active_codes_list) if training else 0

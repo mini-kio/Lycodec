@@ -142,51 +142,24 @@ def stereo_metrics_inline(target, pred, eps=1e-8):
     metrics['l1'] = float(l1.item())
 
     # SI-SDR (Scale-Invariant Signal-to-Distortion Ratio)
-    # Compute per sample, then average
-    target_flat = target.reshape(target.shape[0], -1)
-    pred_flat = pred.reshape(pred.shape[0], -1)
+    # Compute per-channel for stereo, then average
+    B, C, T = target.shape
+    si_sdrs = []
 
-    # Project pred onto target
-    alpha = (target_flat * pred_flat).sum(dim=1, keepdim=True) / (target_flat.pow(2).sum(dim=1, keepdim=True) + eps)
-    target_scaled = alpha * target_flat
+    for ch in range(C):
+        target_ch = target[:, ch, :]  # [B, T]
+        pred_ch = pred[:, ch, :]      # [B, T]
 
-    # Signal and noise
-    noise = pred_flat - target_scaled
-    si_sdr = 10 * torch.log10((target_scaled.pow(2).sum(dim=1) + eps) / (noise.pow(2).sum(dim=1) + eps))
-    metrics['si_sdr'] = float(si_sdr.mean().item())
+        # Project pred onto target
+        alpha = (target_ch * pred_ch).sum(dim=1, keepdim=True) / (target_ch.pow(2).sum(dim=1, keepdim=True) + eps)
+        target_scaled = alpha * target_ch
 
-    # Stereo correlation (measures stereo field preservation)
-    if target.shape[1] == 2:  # Only for stereo
-        # Correlation between left and right channels
-        def channel_corr(x):
-            left = x[:, 0, :]  # [B, T]
-            right = x[:, 1, :]  # [B, T]
-            left_centered = left - left.mean(dim=-1, keepdim=True)
-            right_centered = right - right.mean(dim=-1, keepdim=True)
-            corr = (left_centered * right_centered).sum(dim=-1) / (
-                torch.sqrt(left_centered.pow(2).sum(dim=-1) * right_centered.pow(2).sum(dim=-1)) + eps
-            )
-            return corr.mean()
+        # Signal and noise
+        noise = pred_ch - target_scaled
+        si_sdr_ch = 10 * torch.log10((target_scaled.pow(2).sum(dim=1) + eps) / (noise.pow(2).sum(dim=1) + eps))
+        si_sdrs.append(si_sdr_ch.mean())
 
-        # Mid/Side energy ratio (detects mono collapse)
-        def ms_ratio(x):
-            M = (x[:, 0, :] + x[:, 1, :]) * 0.5  # Mid [B, T]
-            S = (x[:, 0, :] - x[:, 1, :]) * 0.5  # Side [B, T]
-            eM = M.pow(2).mean(dim=-1)  # [B]
-            eS = S.pow(2).mean(dim=-1)  # [B]
-            return (eS / (eM + eS + eps)).mean()
-
-        corr_target = channel_corr(target)
-        corr_pred = channel_corr(pred)
-        metrics['stereo_corr_target'] = float(corr_target.item())
-        metrics['stereo_corr_pred'] = float(corr_pred.item())
-        metrics['stereo_corr_diff'] = float(abs(corr_target - corr_pred).item())
-
-        # M/S ratio metrics
-        ms_target = ms_ratio(target)
-        ms_pred = ms_ratio(pred)
-        metrics['ms_ratio_target'] = float(ms_target.item())
-        metrics['ms_ratio_pred'] = float(ms_pred.item())
-        metrics['ms_ratio_diff'] = float(abs(ms_target - ms_pred).item())
+    # Average across channels
+    metrics['si_sdr'] = float(torch.stack(si_sdrs).mean().item())
 
     return metrics
